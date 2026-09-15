@@ -768,6 +768,55 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   }
 });
 
+test('cli: concurrent deliveries cannot replace the active attempt ownership', async () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'concurrent-delivery.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const ready = path.join(tmp, 'concurrent-delivery.ready');
+  const release = path.join(tmp, 'concurrent-delivery.release');
+  const wrapper = path.join(tmp, 'hold-active-delivery.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const writeFileSync = fs.writeFileSync;
+fs.writeFileSync = (file, value, options) => {
+  const result = writeFileSync(file, value, options);
+  if (String(file).endsWith('specification.snapshot.json')) {
+    writeFileSync(${JSON.stringify(ready)}, 'ready');
+    while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+  const active = spawn(process.execPath, [wrapper], { cwd: skillRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  let activeStdout = '';
+  let activeStderr = '';
+  active.stdout.on('data', (chunk) => { activeStdout += chunk; });
+  active.stderr.on('data', (chunk) => { activeStderr += chunk; });
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(ready) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.existsSync(ready), true, 'active delivery did not reach the overlap point');
+
+  const rejected = run(['deliver', 'workflow', initialInput, out, '--json']);
+  assert.equal(rejected.status, 1);
+  const rejection = JSON.parse(rejected.stdout);
+  assert.equal(rejection.diagnostics[0].code, 'delivery/concurrent-attempt');
+  assert.equal('provenance' in rejection, false);
+
+  fs.writeFileSync(release, 'release');
+  const activeExit = await new Promise((resolve) => active.once('close', (code, signal) => resolve({ code, signal })));
+  assert.deepEqual(activeExit, { code: 0, signal: null }, activeStderr);
+  const activeReceipt = JSON.parse(activeStdout);
+  const provenance = JSON.parse(fs.readFileSync(out.replace(/\.html$/, '.delivery.json'), 'utf8'));
+  assert.equal(provenance.status, 'current');
+  assert.equal(provenance.receiptId, activeReceipt.receiptId);
+  assert.equal(fs.existsSync(out.replace(/\.html$/, '.delivery-lock.json')), false);
+});
+
 test('cli: delivery provenance cannot replace its input specification', () => {
   const input = path.join(tmp, 'provenance-input-alias.delivery.json');
   const source = fs.readFileSync(path.join(skillRoot, 'examples/agent-tool-call.workflow.json'));

@@ -21,6 +21,61 @@ function deliveryPendingPath(artifactPath) {
   return deliveryProvenancePath(artifactPath).replace(/\.json$/, '-pending.json');
 }
 
+function deliveryLockPath(artifactPath) {
+  return deliveryProvenancePath(artifactPath).replace(/\.json$/, '-lock.json');
+}
+
+function processIsRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== 'ESRCH';
+  }
+}
+
+function acquireDeliveryLock(output, receiptId) {
+  const lockPath = deliveryLockPath(output);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let descriptor;
+    try {
+      descriptor = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, receiptId, pid: process.pid })}\n`);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      return () => {
+        try {
+          const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+          if (lock.receiptId === receiptId) fs.unlinkSync(lockPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') {
+            console.error(`Warning: could not release delivery lock "${lockPath}": ${error.message}`);
+          }
+        }
+      };
+    } catch (error) {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+      if (error.code !== 'EEXIST') throw error;
+      let lock;
+      try {
+        lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      } catch {
+        throw new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`);
+      }
+      if (processIsRunning(lock.pid)) {
+        throw new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`);
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch (removeError) {
+        throw new Error(`Could not recover stale delivery lock "${lockPath}": ${removeError.message}`);
+      }
+    }
+  }
+  throw new Error(`Could not acquire delivery lock for "${output}".`);
+}
+
 function pathEntryExists(file) {
   try {
     fs.lstatSync(file);
@@ -1280,23 +1335,6 @@ async function commandDeliver(args) {
     return;
   }
 
-  try {
-    beginDeliveryAttempt({ output: outputPath, input: inputPath, receiptId, pathsAlias });
-    attemptStarted = true;
-  } catch (error) {
-    reportDeliveryFailure({
-      json, stage: 'prepare', type, input: inputPath, output: outputPath,
-      error: 'Could not persist the delivery attempt before rendering.',
-      diagnostics: [diagnostic({
-        code: 'delivery/journal-write', message: 'Could not persist the delivery attempt before rendering.',
-        subject: { output: outputPath, journal: deliveryPendingPath(outputPath) },
-        evidence: { reason: error.message },
-        supportedFixes: ['choose a writable output directory with a journal path distinct from the input'],
-      })],
-    });
-    return;
-  }
-
   // Keep the candidate beside the target so the final rename is one
   // same-filesystem commit. A render or artifact-check failure never touches
   // an existing trusted output.
@@ -1326,8 +1364,44 @@ async function commandDeliver(args) {
   const specificationSnapshotPath = path.join(stagingDirectory, 'specification.snapshot.json');
   const provenanceCandidatePath = path.join(stagingDirectory, 'delivery-provenance.json');
   let recoveryRequired = false;
+  let releaseDeliveryLock;
 
   try {
+    try {
+      releaseDeliveryLock = acquireDeliveryLock(outputPath, receiptId);
+    } catch (error) {
+      const message = `Could not start delivery for "${outputPath}": ${error.message}`;
+      reportArtifactFailure({
+        command: 'deliver', json, stage: 'prepare', type, input: inputPath, output: outputPath, receiptId,
+        error: message,
+        diagnostics: [diagnostic({
+          code: 'delivery/concurrent-attempt',
+          message: 'Another delivery attempt already owns this output.',
+          subject: { output: outputPath, lock: deliveryLockPath(outputPath) },
+          evidence: { reason: error.message },
+          supportedFixes: ['wait for the active delivery to finish, then retry'],
+        })],
+      });
+      return;
+    }
+
+    try {
+      beginDeliveryAttempt({ output: outputPath, input: inputPath, receiptId, pathsAlias });
+      attemptStarted = true;
+    } catch (error) {
+      reportDeliveryFailure({
+        json, stage: 'prepare', type, input: inputPath, output: outputPath,
+        error: 'Could not persist the delivery attempt before rendering.',
+        diagnostics: [diagnostic({
+          code: 'delivery/journal-write', message: 'Could not persist the delivery attempt before rendering.',
+          subject: { output: outputPath, journal: deliveryPendingPath(outputPath) },
+          evidence: { reason: error.message },
+          supportedFixes: ['choose a writable output directory with a journal path distinct from the input'],
+        })],
+      });
+      return;
+    }
+
     try {
       fs.writeFileSync(specificationSnapshotPath, specification, { flag: 'wx' });
     } catch (error) {
@@ -1623,6 +1697,7 @@ async function commandDeliver(args) {
       if (receipt.open?.status === 'opened') console.log(`opened ${outputPath}`);
     }
   } finally {
+    releaseDeliveryLock?.();
     if (recoveryRequired) {
       console.error(`Recovery required: delivery backups were retained at "${stagingDirectory}".`);
     } else {
