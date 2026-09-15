@@ -817,6 +817,30 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(fs.existsSync(out.replace(/\.html$/, '.delivery-lock.json')), false);
 });
 
+test('cli: delivery lock cannot replace its input specification', () => {
+  const input = path.join(tmp, 'lock-input-alias.delivery-lock.json');
+  const source = fs.readFileSync(path.join(skillRoot, 'examples/agent-tool-call.workflow.json'));
+  fs.writeFileSync(input, source);
+  const out = input.replace(/\.delivery-lock\.json$/, '.html');
+  const result = run(['deliver', 'workflow', input, out, '--json']);
+  assert.equal(result.status, 1);
+  assert.deepEqual(fs.readFileSync(input), source);
+  assert.equal(fs.existsSync(out), false);
+  assert.equal('provenance' in JSON.parse(result.stdout), false);
+});
+
+test('cli: delivery preserves unrecognized JSON at the lock path', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'unrecognized-lock.html');
+  const lock = out.replace(/\.html$/, '.delivery-lock.json');
+  const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, sentinel: 'user data' }));
+  fs.writeFileSync(lock, bytes);
+  const result = run(['deliver', 'workflow', input, out, '--json']);
+  assert.equal(result.status, 1);
+  assert.deepEqual(fs.readFileSync(lock), bytes);
+  assert.equal(fs.existsSync(out), false);
+});
+
 test('cli: delivery provenance cannot replace its input specification', () => {
   const input = path.join(tmp, 'provenance-input-alias.delivery.json');
   const source = fs.readFileSync(path.join(skillRoot, 'examples/agent-tool-call.workflow.json'));

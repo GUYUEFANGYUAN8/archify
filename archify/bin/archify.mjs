@@ -35,8 +35,11 @@ function processIsRunning(pid) {
   }
 }
 
-function acquireDeliveryLock(output, receiptId) {
+function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias) {
   const lockPath = deliveryLockPath(output);
+  if (pathsAlias(lockPath, inputPath)) {
+    throw new Error('Delivery lock path aliases the input specification; choose another output path.');
+  }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let descriptor;
     try {
@@ -59,7 +62,13 @@ function acquireDeliveryLock(output, receiptId) {
       if (error.code !== 'EEXIST') throw error;
       let lock;
       try {
+        if (!fs.lstatSync(lockPath).isFile()) throw new Error('Not a regular lock file.');
         lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+        if (lock?.schemaVersion !== 1 || !Number.isSafeInteger(lock.pid) || lock.pid <= 0
+          || typeof lock.receiptId !== 'string'
+          || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(lock.receiptId)) {
+          throw new Error('Unrecognized delivery lock.');
+        }
       } catch {
         throw new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`);
       }
@@ -1393,7 +1402,7 @@ async function commandDeliver(args) {
 
   try {
     try {
-      releaseDeliveryLock = acquireDeliveryLock(outputPath, receiptId);
+      releaseDeliveryLock = acquireDeliveryLock(outputPath, receiptId, inputPath, pathsAlias);
     } catch (error) {
       const message = `Could not start delivery for "${outputPath}": ${error.message}`;
       reportArtifactFailure({
