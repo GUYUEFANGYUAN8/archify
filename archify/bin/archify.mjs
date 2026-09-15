@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +17,35 @@ function deliveryProvenancePath(artifactPath) {
   return `${artifact.replace(/\.html?$/i, '')}.delivery.json`;
 }
 
+function deliveryPendingPath(artifactPath) {
+  return deliveryProvenancePath(artifactPath).replace(/\.json$/, '-pending.json');
+}
+
+function pathEntryExists(file) {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+    throw error;
+  }
+}
+
+function artifactIdentity(artifact) {
+  return { sha256: createHash('sha256').update(artifact).digest('hex'), bytes: artifact.byteLength };
+}
+
+function beginDeliveryAttempt({ output, input, receiptId, pathsAlias }) {
+  const journal = deliveryPendingPath(output);
+  for (const protectedPath of [input, output, deliveryProvenancePath(output)].filter(Boolean)) {
+    if (pathsAlias(journal, protectedPath)) throw new Error('Delivery journal aliases an input or output.');
+  }
+  writeDeliveryProvenance(journal, {
+    schemaVersion: 1, command: 'deliver', status: 'pending', receiptId,
+    input, output: path.resolve(output),
+  });
+}
+
 function writeDeliveryProvenance(file, value) {
   const stagingDirectory = fs.mkdtempSync(path.join(path.dirname(file), '.archify-provenance-'));
   const temporary = path.join(stagingDirectory, path.basename(file));
@@ -28,36 +57,98 @@ function writeDeliveryProvenance(file, value) {
   }
 }
 
-function recordDeliveryFailure({ output, stage, input, error }) {
-  if (!output || !/\.html?$/i.test(output)) return;
+function recordDeliveryFailure({ output, stage, input, error, receiptId, pathsAlias, attemptStarted }) {
+  if (!output || !/\.html?$/i.test(output)) return { ok: true, status: 'not-applicable' };
+  // Keep independent evidence even when the artifact is unreadable or the
+  // provenance target is locked, aliases the input, or cannot be replaced.
+  let journalError;
+  if (!attemptStarted) {
+    try {
+      beginDeliveryAttempt({ output, input, receiptId, pathsAlias });
+    } catch (cause) {
+      journalError = cause;
+    }
+  }
   let artifact;
   try {
     artifact = fs.readFileSync(output);
-  } catch {
-    return;
+  } catch (readError) {
+    if (readError.code === 'ENOENT' || readError.code === 'ENOTDIR') {
+      return { ok: true, status: 'absent' };
+    }
+    // A failed marker does not need an artifact hash to invalidate old evidence.
+  }
+  const provenancePath = deliveryProvenancePath(output);
+  let aliasesProtectedPath;
+  try {
+    aliasesProtectedPath = (input && pathsAlias(provenancePath, input))
+      || pathsAlias(provenancePath, output);
+  } catch (aliasError) {
+    return {
+      ok: false,
+      status: 'unrecorded',
+      diagnostic: diagnostic({
+        code: 'delivery/provenance-path-resolution',
+        message: 'Delivery failure provenance could not resolve its target safely.',
+        subject: { output: path.resolve(output), provenance: provenancePath },
+        evidence: {
+          reason: aliasError.message,
+          ...(aliasError?.code ? { systemCode: aliasError.code } : {}),
+        },
+        supportedFixes: ['remove the sidecar path conflict or symbolic-link cycle, then rerun deliver'],
+      }),
+    };
+  }
+  if (aliasesProtectedPath) {
+    return {
+      ok: false,
+      status: 'unrecorded',
+      diagnostic: diagnostic({
+        code: 'delivery/provenance-target-alias',
+        message: 'Delivery failure provenance could not be recorded without replacing an input or the artifact.',
+        subject: { output: path.resolve(output), provenance: provenancePath },
+        evidence: { ...(input ? { input: path.resolve(input) } : {}) },
+        supportedFixes: ['choose an output whose .delivery.json sidecar is distinct from every input and the HTML artifact'],
+      }),
+    };
   }
   try {
-    writeDeliveryProvenance(deliveryProvenancePath(output), {
+    writeDeliveryProvenance(provenancePath, {
       schemaVersion: 1,
+      receiptId,
       status: 'failed',
       command: 'deliver',
       stage,
       input,
       output: path.resolve(output),
-      artifact: {
-        sha256: createHash('sha256').update(artifact).digest('hex'),
-        bytes: artifact.byteLength,
-      },
+      ...(artifact ? { artifact: artifactIdentity(artifact) } : {}),
       error,
     });
-  } catch {
-    // The original delivery diagnostic and exit status remain authoritative.
+    return { ok: true, status: 'failed' };
+  } catch (writeError) {
+    return {
+      ok: false,
+      status: 'unrecorded',
+      diagnostic: diagnostic({
+        code: 'delivery/provenance-write',
+        message: 'The failed delivery could not persist its stale-artifact marker.',
+        subject: { output: path.resolve(output), provenance: provenancePath },
+        evidence: {
+          reason: writeError.message,
+          ...(writeError?.code ? { systemCode: writeError.code } : {}),
+          failureJournalRecorded: !journalError,
+          ...(journalError ? { journalError: journalError.message } : {}),
+        },
+        supportedFixes: ['restore write access to the output directory, then rerun deliver before trusting the artifact'],
+      }),
+    };
   }
 }
 
 function deliverySuccessProvenance(receipt) {
   return {
     schemaVersion: 1,
+    receiptId: receipt.receiptId,
     status: 'current',
     command: 'deliver',
     type: receipt.type,
@@ -68,23 +159,126 @@ function deliverySuccessProvenance(receipt) {
   };
 }
 
-function inspectDeliveryProvenance(artifactPath, artifact) {
+function inspectDeliveryProvenance(artifactPath, artifact, { requireProvenance = false } = {}) {
   const sidecar = deliveryProvenancePath(artifactPath);
-  if (!fs.existsSync(sidecar)) return { ok: true, status: 'unknown' };
+  const pending = deliveryPendingPath(artifactPath);
+  try {
+    if (pathEntryExists(pending)) {
+      return {
+        ok: false, status: 'failed',
+        diagnostics: [diagnostic({
+          code: 'delivery/provenance-failed',
+          message: 'A delivery attempt is unfinished or failed; complete a successful deliver before trusting this artifact.',
+          subject: { artifact: path.resolve(artifactPath), provenance: sidecar },
+          evidence: { pendingJournal: pending, found: true },
+          supportedFixes: ['finish any active delivery, then rerun deliver successfully; retain the pending journal until recovery succeeds'],
+        })],
+      };
+    }
+  } catch (error) {
+    return invalidProvenance(artifactPath, pending, error.message);
+  }
+  let found;
+  try {
+    found = pathEntryExists(sidecar);
+  } catch (error) {
+    return invalidProvenance(artifactPath, sidecar, error.message);
+  }
+  if (!found) {
+    if (!requireProvenance) return { ok: true, status: 'unknown' };
+    const message = 'Delivery provenance is required, but the artifact has no .delivery.json sidecar.';
+    return {
+      ok: false,
+      status: 'unknown',
+      diagnostics: [diagnostic({
+        code: 'delivery/provenance-required',
+        message,
+        subject: { artifact: path.resolve(artifactPath), provenance: sidecar },
+        evidence: { required: true, found: false },
+        supportedFixes: ['rerun deliver for the current specification, then retry with --require-provenance'],
+      })],
+    };
+  }
   let receipt;
   try {
+    if (!fs.lstatSync(sidecar).isFile()) throw new Error('Delivery provenance must be a regular file, not a symbolic link or directory.');
     receipt = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+    const identityValid = (value) => value && typeof value.sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.sha256)
+      && Number.isSafeInteger(value.bytes) && value.bytes >= 0;
+    if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)
+      || receipt.schemaVersion !== 1 || receipt.command !== 'deliver'
+      || typeof receipt.receiptId !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receipt.receiptId)
+      || typeof receipt.output !== 'string' || !path.isAbsolute(receipt.output) || path.resolve(receipt.output) !== path.resolve(artifactPath)
+      || typeof receipt.input !== 'string' || !path.isAbsolute(receipt.input)
+      || !['current', 'failed'].includes(receipt.status)
+      || (receipt.status === 'current' && (!TYPES.has(receipt.type)
+        || !identityValid(receipt.specification) || !identityValid(receipt.artifact)))
+      || (receipt.status === 'failed' && typeof receipt.stage !== 'string')) {
+      throw new Error('Delivery provenance does not conform to the supported receipt schema.');
+    }
   } catch (error) {
-    return { ok: false, status: 'invalid', error: `Could not read delivery provenance: ${error.message}` };
+    const message = `Could not read delivery provenance: ${error.message}`;
+    return {
+      ok: false,
+      status: 'invalid',
+      diagnostics: [diagnostic({
+        code: 'delivery/provenance-invalid',
+        message,
+        subject: { artifact: path.resolve(artifactPath), provenance: sidecar },
+        evidence: { reason: error.message },
+        supportedFixes: ['rerun deliver to replace the invalid provenance sidecar'],
+      })],
+    };
   }
   const actualSha256 = createHash('sha256').update(artifact).digest('hex');
-  if (receipt.status !== 'current') {
-    return { ok: false, status: receipt.status || 'invalid', error: 'The artifact is stale because the latest delivery attempt failed.' };
+  if (receipt.status === 'failed') {
+    const message = 'The artifact is stale because the latest delivery attempt failed.';
+    return {
+      ok: false,
+      status: 'failed',
+      receiptId: receipt.receiptId,
+      diagnostics: [diagnostic({
+        code: 'delivery/provenance-failed',
+        message,
+        subject: { artifact: path.resolve(artifactPath), provenance: sidecar },
+        evidence: { stage: receipt.stage, deliveryReceiptId: receipt.receiptId },
+        supportedFixes: ['repair the specification and complete a successful deliver before checking this artifact'],
+      })],
+    };
   }
   if (receipt.artifact?.sha256 !== actualSha256 || receipt.artifact?.bytes !== artifact.byteLength) {
-    return { ok: false, status: 'mismatch', error: 'The artifact bytes do not match their delivery provenance.' };
+    const message = 'The artifact bytes do not match their delivery provenance.';
+    return {
+      ok: false,
+      status: 'mismatch',
+      receiptId: receipt.receiptId,
+      diagnostics: [diagnostic({
+        code: 'delivery/provenance-mismatch',
+        message,
+        subject: { artifact: path.resolve(artifactPath), provenance: sidecar },
+        evidence: {
+          expectedSha256: receipt.artifact?.sha256,
+          actualSha256,
+          expectedBytes: receipt.artifact?.bytes,
+          actualBytes: artifact.byteLength,
+        },
+        supportedFixes: ['restore the delivered artifact or rerun deliver to create a matching artifact and provenance pair'],
+      })],
+    };
   }
-  return { ok: true, status: 'current' };
+  return { ok: true, status: 'current', receiptId: receipt.receiptId, artifact: receipt.artifact };
+}
+
+function invalidProvenance(artifactPath, sidecar, reason) {
+  return {
+    ok: false, status: 'invalid',
+    diagnostics: [diagnostic({
+      code: 'delivery/provenance-invalid', message: 'Delivery provenance could not be verified.',
+      subject: { artifact: artifactPath, provenance: sidecar }, evidence: { reason },
+      supportedFixes: ['restore access to the delivery records, then rerun deliver successfully'],
+    })],
+  };
 }
 
 function usage() {
@@ -96,8 +290,8 @@ function usage() {
   archify validate <type> <input.json> [--json] [--layout-json] [--quality standard|showcase] [--repo-root path (architecture only)]
   archify migrate workflow <old.json> <new.json> --to-schema 2 [--json]
   archify inspect <type> <input.json>
-  archify check <output.html>
-  archify visual-check <output.html> [--json]
+  archify check <output.html> [--require-provenance]
+  archify visual-check <output.html> [--json] [--require-provenance]
   archify guide [scenario or question] [--json] [--lang en|zh]
   archify brands [name, alias, domain, or category] [--json]
   archify brands capture <url> [--json]
@@ -891,17 +1085,19 @@ function commandRender(args) {
   if (result.status !== 0) exitFrom(result);
 }
 
-function reportArtifactFailure({ command, json, stage, type, input, output, error, diagnostics = [], status = 1, checker }) {
+function reportArtifactFailure({ command, json, stage, type, input, output, error, diagnostics = [], status = 1, checker, receiptId, provenance }) {
   const receipt = {
     schemaVersion: 1,
     ok: false,
     command,
+    ...(receiptId ? { receiptId } : {}),
     stage,
     type,
     input,
     ...(output === undefined ? {} : { output }),
     error,
     diagnostics,
+    ...(provenance ? { provenance } : {}),
     ...(checker ? { checker } : {}),
   };
   if (json) console.log(JSON.stringify(receipt, null, 2));
@@ -909,9 +1105,20 @@ function reportArtifactFailure({ command, json, stage, type, input, output, erro
   process.exitCode = status;
 }
 
-function reportDeliveryFailure(options) {
-  if (!options.preserveProvenance) recordDeliveryFailure(options);
-  reportArtifactFailure({ ...options, command: 'deliver' });
+function writeDeliveryFailureReceipt(options) {
+  const receiptId = options.receiptId || randomUUID();
+  const recorded = recordDeliveryFailure({ ...options, receiptId });
+  const diagnostics = [
+    ...(options.diagnostics || []),
+    ...(recorded.diagnostic ? [recorded.diagnostic] : []),
+  ];
+  reportArtifactFailure({
+    ...options,
+    command: 'deliver',
+    receiptId,
+    provenance: recorded.status,
+    diagnostics,
+  });
 }
 
 function reportValidateFailure(options) {
@@ -972,7 +1179,10 @@ async function commandDeliver(args) {
   });
   assertEvidenceType(type, repoArgs.repoRoot);
   const renderer = rendererPath(type);
-  const { resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
+  const { pathsAlias, resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
+  const receiptId = randomUUID();
+  let attemptStarted = false;
+  const reportDeliveryFailure = (options) => writeDeliveryFailureReceipt({ ...options, pathsAlias, receiptId, attemptStarted });
   const inputPath = path.resolve(input);
   let specification;
   let diagram;
@@ -997,12 +1207,21 @@ async function commandDeliver(args) {
     ? diagram.meta.output
     : undefined;
   let outputPath;
+  let provenancePath;
   try {
     ({ outputPath } = resolveOutputPath({
       requestedOutput,
       authoredOutput,
       defaultOutput: `${type}.html`,
       inputPaths: [inputPath],
+    }));
+    ({ outputPath: provenancePath } = resolveOutputPath({
+      requestedOutput: deliveryProvenancePath(outputPath),
+      defaultOutput: deliveryProvenancePath(outputPath),
+      requiredExtension: '.json',
+      inputPaths: [inputPath],
+      inputDescription: 'the delivery input',
+      otherOutputPaths: [outputPath],
     }));
   } catch (error) {
     const attemptedOutput = path.resolve(requestedOutput || authoredOutput || `${type}.html`);
@@ -1046,6 +1265,23 @@ async function commandDeliver(args) {
     return;
   }
 
+  try {
+    beginDeliveryAttempt({ output: outputPath, input: inputPath, receiptId, pathsAlias });
+    attemptStarted = true;
+  } catch (error) {
+    reportDeliveryFailure({
+      json, stage: 'prepare', type, input: inputPath, output: outputPath,
+      error: 'Could not persist the delivery attempt before rendering.',
+      diagnostics: [diagnostic({
+        code: 'delivery/journal-write', message: 'Could not persist the delivery attempt before rendering.',
+        subject: { output: outputPath, journal: deliveryPendingPath(outputPath) },
+        evidence: { reason: error.message },
+        supportedFixes: ['choose a writable output directory with a journal path distinct from the input'],
+      })],
+    });
+    return;
+  }
+
   // Keep the candidate beside the target so the final rename is one
   // same-filesystem commit. A render or artifact-check failure never touches
   // an existing trusted output.
@@ -1073,7 +1309,6 @@ async function commandDeliver(args) {
   }
   const candidatePath = path.join(stagingDirectory, path.basename(outputPath));
   const specificationSnapshotPath = path.join(stagingDirectory, 'specification.snapshot.json');
-  const provenancePath = deliveryProvenancePath(outputPath);
   const provenanceCandidatePath = path.join(stagingDirectory, 'delivery-provenance.json');
 
   try {
@@ -1210,6 +1445,7 @@ async function commandDeliver(args) {
     const engineeringProfile = engineeringProfileFromArtifact(artifact);
     const receipt = {
       schemaVersion: 1,
+      receiptId,
       ok: true,
       command: 'deliver',
       type,
@@ -1269,11 +1505,20 @@ async function commandDeliver(args) {
     }
 
     try {
-      resolveOutputPath({
+      const currentOutputPath = resolveOutputPath({
         requestedOutput,
         authoredOutput,
         defaultOutput: `${type}.html`,
         inputPaths: [inputPath],
+        otherOutputPaths: [provenancePath],
+      }).outputPath;
+      resolveOutputPath({
+        requestedOutput: deliveryProvenancePath(currentOutputPath),
+        defaultOutput: deliveryProvenancePath(currentOutputPath),
+        requiredExtension: '.json',
+        inputPaths: [inputPath],
+        inputDescription: 'the delivery input',
+        otherOutputPaths: [currentOutputPath],
       });
     } catch (error) {
       reportDeliveryFailure({
@@ -1295,6 +1540,9 @@ async function commandDeliver(args) {
     }
 
     try {
+      if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
+        throw new Error('A newer delivery attempt owns this output; retry after it finishes.');
+      }
       commitDeliveryPair({
         htmlCandidate: candidatePath,
         provenanceCandidate: provenanceCandidatePath,
@@ -1302,12 +1550,15 @@ async function commandDeliver(args) {
         provenancePath,
         stagingDirectory,
       });
+      if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
+        throw new Error('Delivery ownership changed during commit; the pending journal was retained.');
+      }
+      fs.unlinkSync(deliveryPendingPath(outputPath));
     } catch (error) {
       const message = `Could not commit verified delivery "${outputPath}": ${error.message}`;
       reportDeliveryFailure({
         json,
         stage: 'commit',
-        preserveProvenance: true,
         type,
         input: inputPath,
         output: outputPath,
@@ -1396,96 +1647,177 @@ async function commandPreview(args) {
   }
 }
 
-function commandCheck(args) {
-  const unknown = args.find((arg) => arg.startsWith('--'));
-  if (unknown) fail(`Unknown check option "${unknown}".`);
-  const [html] = args;
-  if (!html || args.length !== 1) fail(usage());
-  const artifactPath = path.resolve(html);
+function inspectArtifactDeliveryProvenance(artifactPath, requireProvenance) {
   let artifact;
   try {
     artifact = fs.readFileSync(artifactPath);
-  } catch {
-    // Preserve the checker's existing missing/unreadable-file diagnostic.
+  } catch (error) {
+    return {
+      ok: false, status: 'unknown',
+      diagnostics: [diagnostic({
+        code: 'input/artifact-unreadable', message: `Could not read the HTML artifact: ${error.message}`,
+        subject: { artifact: artifactPath },
+        evidence: { reason: error.message, ...(error.code ? { systemCode: error.code } : {}) },
+        supportedFixes: ['provide an existing readable .html artifact, then rerun the checker'],
+      })],
+    };
   }
-  if (artifact) {
-    const provenance = inspectDeliveryProvenance(artifactPath, artifact);
-    if (!provenance.ok) {
-      console.log(JSON.stringify({
-        schemaVersion: 1,
-        ok: false,
-        file: artifactPath,
-        provenance: provenance.status,
-        diagnostic: provenance.error,
-      }, null, 2));
-      process.exitCode = 1;
-      return;
+  return { ...inspectDeliveryProvenance(artifactPath, artifact, { requireProvenance }), artifact: artifactIdentity(artifact) };
+}
+
+function verifyDeliveryUnchanged(artifactPath, expected, checkedArtifact) {
+  const current = inspectArtifactDeliveryProvenance(artifactPath, false);
+  if (current && !current.ok) return current;
+  if (!current || !expected || current.status !== expected.status || current.receiptId !== expected.receiptId
+    || current.artifact.sha256 !== expected.artifact.sha256 || current.artifact.bytes !== expected.artifact.bytes
+    || checkedArtifact.sha256 !== expected.artifact.sha256 || checkedArtifact.bytes !== expected.artifact.bytes) {
+    return {
+      ok: false, status: 'mismatch',
+      diagnostics: [diagnostic({
+        code: 'delivery/provenance-mismatch', message: 'The artifact or delivery record changed during inspection.',
+        subject: { artifact: artifactPath },
+        evidence: { expected: expected?.artifact, checked: checkedArtifact, current: current?.artifact },
+        supportedFixes: ['finish delivery and other writes before rerunning the checker'],
+      })],
+    };
+  }
+  return current;
+}
+
+function provenanceFailureReceipt({ command, artifactPath, provenance }) {
+  const error = provenance.diagnostics[0].message;
+  return {
+    schemaVersion: 1,
+    ok: false,
+    command,
+    ...(command === 'visual-check' ? {
+      evidenceKind: 'automated-browser',
+      status: 'fail',
+      visualReview: 'pending',
+    } : {}),
+    provenance: provenance.status,
+    ...(provenance.receiptId ? { deliveryReceiptId: provenance.receiptId } : {}),
+    artifact: { path: artifactPath },
+    error,
+    ...(command === 'check' ? { file: artifactPath, diagnostic: error } : {}),
+    diagnostics: provenance.diagnostics,
+  };
+}
+
+function commandCheck(args) {
+  const knownOptions = new Set(['--require-provenance']);
+  const unknown = args.find((arg) => arg.startsWith('--') && !knownOptions.has(arg));
+  if (unknown) fail(`Unknown check option "${unknown}".`);
+  const requireProvenance = args.includes('--require-provenance');
+  const positional = args.filter((arg) => !knownOptions.has(arg));
+  const [html] = positional;
+  if (!html || positional.length !== 1) fail(usage());
+  const artifactPath = path.resolve(html);
+  const provenance = inspectArtifactDeliveryProvenance(artifactPath, requireProvenance);
+  if (provenance && !provenance.ok) {
+    console.log(JSON.stringify(provenanceFailureReceipt({ command: 'check', artifactPath, provenance }), null, 2));
+    process.exitCode = 1;
+    return;
+  }
+  const result = runNode([path.join(skillRoot, 'scripts/check-render-output.mjs'), html], { stdio: 'pipe' });
+  if (result.error) {
+    console.error(result.error.message);
+    process.exitCode = 1;
+    return;
+  }
+  if (result.stdout) {
+    try {
+      const receipt = JSON.parse(result.stdout);
+      if (provenance) {
+        const verified = verifyDeliveryUnchanged(artifactPath, provenance, receipt.artifact || {});
+        if (!verified.ok) {
+          console.log(JSON.stringify(provenanceFailureReceipt({ command: 'check', artifactPath, provenance: verified }), null, 2));
+          process.exitCode = 1;
+          return;
+        }
+        receipt.provenance = provenance.status;
+        if (provenance.receiptId) receipt.deliveryReceiptId = provenance.receiptId;
+      }
+      console.log(JSON.stringify(receipt, null, 2));
+    } catch {
+      process.stdout.write(result.stdout);
     }
   }
-  const result = runNode([path.join(skillRoot, 'scripts/check-render-output.mjs'), html]);
-  if (result.status !== 0) exitFrom(result);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) process.exitCode = result.status ?? 1;
 }
 
 async function commandVisualCheck(args) {
   const json = args.includes('--json');
-  const knownOptions = new Set(['--json']);
+  const requireProvenance = args.includes('--require-provenance');
+  const knownOptions = new Set(['--json', '--require-provenance']);
   const unknown = args.filter((arg) => arg.startsWith('--') && !knownOptions.has(arg));
   if (unknown.length) fail(`Unknown visual-check option "${unknown[0]}".`, 1);
   const positional = args.filter((arg) => !knownOptions.has(arg));
   if (positional.length !== 1) fail(usage(), 1);
 
   const artifactPath = path.resolve(positional[0]);
-  let artifact;
-  try {
-    artifact = fs.readFileSync(artifactPath);
-  } catch {
-    // Preserve visual-check's existing missing/unreadable-file diagnostic.
-  }
-  if (artifact) {
-    const provenance = inspectDeliveryProvenance(artifactPath, artifact);
-    if (!provenance.ok) {
-      const receipt = {
-        schemaVersion: 1,
-        ok: false,
-        command: 'visual-check',
-        evidenceKind: 'automated-browser',
-        status: 'fail',
-        visualReview: 'pending',
-        provenance: provenance.status,
-        artifact: { path: artifactPath },
-        error: provenance.error,
-      };
-      if (json) console.log(JSON.stringify(receipt, null, 2));
-      else console.error(`automated browser evidence failed: ${receipt.error}`);
-      process.exitCode = 1;
-      return;
-    }
-  }
-
+  const provenance = inspectArtifactDeliveryProvenance(artifactPath, requireProvenance);
   let runVisualCheck;
+  let persistVisualCheckFailure;
   try {
-    ({ runVisualCheck } = await import('./visual-check.mjs'));
+    ({ runVisualCheck, persistVisualCheckFailure } = await import('./visual-check.mjs'));
   } catch (error) {
     fail(`Could not load visual-check: ${error.message}`, 1);
+  }
+  if (provenance && !provenance.ok) {
+    const receipt = persistVisualCheckFailure(artifactPath,
+      provenanceFailureReceipt({ command: 'visual-check', artifactPath, provenance }));
+    if (json) console.log(JSON.stringify(receipt, null, 2));
+    else {
+      console.error(formatDiagnostics(`automated browser evidence failed: ${receipt.error}`, receipt.diagnostics));
+      console.error('perceptual visual review pending');
+    }
+    process.exitCode = 1;
+    return;
   }
 
   let result;
   try {
-    result = await runVisualCheck({ artifactPath: positional[0] });
+    result = await runVisualCheck({
+      artifactPath: positional[0],
+      ...(provenance ? { deliveryProvenance: provenance } : {}),
+      verifyArtifact: (bytes) => {
+        const verified = verifyDeliveryUnchanged(artifactPath, provenance, artifactIdentity(bytes));
+        if (!verified.ok) {
+          const error = new Error(verified.diagnostics[0].message);
+          error.deliveryProvenance = verified;
+          error.archifyDiagnostics = verified.diagnostics;
+          throw error;
+        }
+      },
+    });
   } catch (error) {
-    if (json) {
-      console.log(JSON.stringify({
+    const failure = persistVisualCheckFailure(artifactPath, {
         schemaVersion: 1,
         ok: false,
         command: 'visual-check',
         evidenceKind: 'automated-browser',
         status: 'fail',
         visualReview: 'pending',
+        ...(provenance ? {
+          provenance: provenance.status,
+          ...(provenance.receiptId ? { deliveryReceiptId: provenance.receiptId } : {}),
+        } : {}),
         artifact: { path: path.resolve(positional[0]) },
         error: error.message,
-      }, null, 2));
+        diagnostics: [diagnostic({
+          code: 'viewer/visual-check-input',
+          message: 'visual-check could not read a valid HTML input or prepare its evidence files.',
+          subject: { artifact: path.resolve(positional[0]) },
+          evidence: { reason: error.message, ...(error.code ? { systemCode: error.code } : {}) },
+          supportedFixes: ['provide an existing readable .html artifact and a writable directory for evidence files'],
+        })],
+      });
+    if (json) {
+      console.log(JSON.stringify(failure, null, 2));
     } else {
-      console.error(`automated browser evidence failed: ${error.message}`);
+      console.error(formatDiagnostics(`automated browser evidence failed: ${failure.error}`, failure.diagnostics));
       console.error('perceptual visual review pending');
     }
     process.exitCode = 1;
