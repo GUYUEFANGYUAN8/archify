@@ -677,6 +677,45 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(JSON.parse(checked.stdout).provenance, 'failed');
 });
 
+test('cli: delivery pair rollback retains recoverable backups when restoration fails', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-pair-recovery-required.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const priorArtifact = fs.readFileSync(out);
+
+  const wrapper = path.join(tmp, 'fail-delivery-rollback-restore.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const renameSync = fs.renameSync;
+fs.renameSync = (source, target) => {
+  if (String(source).endsWith('delivery-provenance.json')) {
+    const error = new Error('injected provenance rename failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  if (String(source).endsWith('.previous-output') && String(target) === ${JSON.stringify(out)}) {
+    const error = new Error('injected output restore failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  return renameSync(source, target);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+  const result = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(result.status, 1);
+  const failure = JSON.parse(result.stdout);
+  const evidence = failure.diagnostics[0].evidence;
+  assert.equal(evidence.recoveryRequired, true);
+  assert.match(result.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.existsSync(evidence.recoveryDirectory), true);
+  const outputBackup = evidence.recoverableBackups.find((entry) => entry.label === 'HTML artifact');
+  assert.ok(outputBackup);
+  assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
+});
+
 test('cli: a process exit after HTML commit remains fail-closed until a successful rerun', () => {
   const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
@@ -743,6 +782,33 @@ test('cli: delivery provenance cannot replace its input specification', () => {
   assert.equal(failure.diagnostics[0].code, 'output/input-alias');
   assert.deepEqual(fs.readFileSync(input), source);
   assert.equal(fs.existsSync(out), false);
+});
+
+test('cli: rejected authored output does not write provenance outside the working directory', () => {
+  const parent = path.join(tmp, 'rejected-authored-output');
+  const workingDirectory = path.join(parent, 'work');
+  fs.mkdirSync(workingDirectory, { recursive: true });
+  const input = path.join(workingDirectory, 'input.workflow.json');
+  const diagram = JSON.parse(fs.readFileSync(path.join(skillRoot, 'examples/agent-tool-call.workflow.json'), 'utf8'));
+  diagram.meta = { ...diagram.meta, output: '../victim.html' };
+  fs.writeFileSync(input, JSON.stringify(diagram));
+  const victim = path.join(parent, 'victim.html');
+  const sidecar = path.join(parent, 'victim.delivery.json');
+  const pending = path.join(parent, 'victim.delivery-pending.json');
+  const artifactBytes = Buffer.from('<!doctype html><title>untouched</title>\n');
+  const sidecarBytes = Buffer.from('{"status":"current","sentinel":true}\n');
+  fs.writeFileSync(victim, artifactBytes);
+  fs.writeFileSync(sidecar, sidecarBytes);
+
+  const result = run(['deliver', 'workflow', input, '--json'], { cwd: workingDirectory });
+
+  assert.equal(result.status, 1);
+  const failure = JSON.parse(result.stdout);
+  assert.equal(failure.diagnostics[0].code, 'output/meta-outside-cwd');
+  assert.deepEqual(fs.readFileSync(victim), artifactBytes);
+  assert.deepEqual(fs.readFileSync(sidecar), sidecarBytes);
+  assert.equal(fs.existsSync(pending), false);
+  assert.equal('provenance' in failure, false);
 });
 
 test('cli: a failed provenance marker write and invalidation still leave a fail-closed journal', () => {

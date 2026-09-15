@@ -740,9 +740,19 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
     const error = new Error(rollbackErrors.length
       ? 'Delivery pair commit failed and its previous files could not be fully restored.'
       : 'Delivery pair commit failed; the previous files were restored.');
+    const recoverableBackups = rollbackErrors.length
+      ? backedUp
+        .filter((item) => pathEntryExists(item.backup))
+        .map((item) => ({ label: item.label, path: item.backup }))
+      : [];
     error.deliveryCommitDetails = {
       reason: cause.message,
-      ...(rollbackErrors.length ? { rollbackErrors } : {}),
+      ...(rollbackErrors.length ? {
+        rollbackErrors,
+        recoveryRequired: true,
+        recoveryDirectory: stagingDirectory,
+        recoverableBackups,
+      } : {}),
     };
     throw error;
   }
@@ -1225,7 +1235,7 @@ async function commandDeliver(args) {
     }));
   } catch (error) {
     const attemptedOutput = path.resolve(requestedOutput || authoredOutput || `${type}.html`);
-    reportDeliveryFailure({
+    const failure = {
       json,
       stage: 'prepare',
       type,
@@ -1239,7 +1249,12 @@ async function commandDeliver(args) {
         evidence: { ...(error?.code ? { systemCode: error.code } : {}) },
         supportedFixes: ['choose a safe output path and retry'],
       })],
-    });
+    };
+    if (outputPath) {
+      reportDeliveryFailure(failure);
+    } else {
+      reportArtifactFailure({ ...failure, command: 'deliver', receiptId });
+    }
     return;
   }
   const outputDirectory = path.dirname(outputPath);
@@ -1310,6 +1325,7 @@ async function commandDeliver(args) {
   const candidatePath = path.join(stagingDirectory, path.basename(outputPath));
   const specificationSnapshotPath = path.join(stagingDirectory, 'specification.snapshot.json');
   const provenanceCandidatePath = path.join(stagingDirectory, 'delivery-provenance.json');
+  let recoveryRequired = false;
 
   try {
     try {
@@ -1555,6 +1571,7 @@ async function commandDeliver(args) {
       }
       fs.unlinkSync(deliveryPendingPath(outputPath));
     } catch (error) {
+      recoveryRequired = error.deliveryCommitDetails?.recoveryRequired === true;
       const message = `Could not commit verified delivery "${outputPath}": ${error.message}`;
       reportDeliveryFailure({
         json,
@@ -1606,10 +1623,14 @@ async function commandDeliver(args) {
       if (receipt.open?.status === 'opened') console.log(`opened ${outputPath}`);
     }
   } finally {
-    try {
-      fs.rmSync(stagingDirectory, { recursive: true, force: true });
-    } catch (error) {
-      console.error(`Warning: could not remove delivery staging directory "${stagingDirectory}": ${error.message}`);
+    if (recoveryRequired) {
+      console.error(`Recovery required: delivery backups were retained at "${stagingDirectory}".`);
+    } else {
+      try {
+        fs.rmSync(stagingDirectory, { recursive: true, force: true });
+      } catch (error) {
+        console.error(`Warning: could not remove delivery staging directory "${stagingDirectory}": ${error.message}`);
+      }
     }
   }
 }
