@@ -2,20 +2,22 @@
 
 ## Validate and deliver
 
-Each output has two independent delivery metadata paths:
+Each output has three independent delivery metadata paths:
 
 - `<output-stem>.delivery.json` records the latest completed attempt.
 - `<output-stem>.delivery-pending.json` is the recovery journal for an attempt
   in progress.
+- `<output-stem>.delivery-lock.json` serializes attempts targeting the same
+  output.
 
 `deliver` creates the journal before rendering and keeps it through the
 recoverable HTML/sidecar pair commit. It removes the journal only after that
 commit completes. A validation or render failure, a locked destination, or a
 process interruption may therefore leave a journal. The journal is a safety
 barrier: `check` and `visual-check` fail closed when any directory entry exists
-at that path, including an unreadable file, symlink, or dangling symlink. Run
-deliveries targeting the same output path serially; one attempt must finish or
-be recovered before another begins.
+at the journal or lock path, including an unreadable file, symlink, or dangling
+symlink. Run deliveries targeting the same output path serially; one attempt
+must finish or be recovered before another begins.
 
 A successful sidecar has `schemaVersion: 1`, `status: "current"`,
 `command: "deliver"`, a unique `receiptId`, the diagram `type`, an absolute
@@ -36,7 +38,7 @@ receipt reports `provenance: "unrecorded"`; no tool can preserve that fact
 across processes. Restore metadata-path access and complete a successful
 `deliver` before trusting the output.
 
-Artifacts with neither sidecar nor journal remain supported for backward
+Artifacts with no sidecar, journal, or lock remain supported for backward
 compatibility and for the lower-level `render` command. Their checker receipts
 report `provenance: "unknown"`; use `--require-provenance` to turn that state
 into a non-zero failure when the workflow requires a successfully delivered
@@ -74,16 +76,19 @@ diagnostic that identifies abandoned private staging requiring cleanup. A
 failed attempt exits non-zero, never invokes an opener, and never authorizes
 visual evidence collection.
 
-Failure to initialize a delivery lock cleans up the lock created by that attempt
-when possible. Filesystem and cleanup errors are reported separately from an
-active concurrent delivery; an unrecognized existing lock is preserved for
-inspection. Fix the reported filesystem error before retrying, and use another
-output path if the lock path contains unrelated data.
+Failure to initialize a delivery lock records failed provenance while the
+attempt still owns the lock, then cleans up that lock when possible. Filesystem
+and cleanup errors are reported separately from an active concurrent delivery.
+An active, unrecognized, or otherwise preserved lock independently prevents
+checkers from accepting the prior artifact. Fix the reported filesystem error
+before retrying, and use another output path if the lock path contains unrelated
+data.
 
 Run strict `check` after `deliver` exits zero. Run `visual-check` only after that
-strict check exits zero. A failed marker or recovery journal makes both commands
-fail before accepting the preserved HTML; report the diagnostics and complete a
-successful recovery delivery before collecting new visual evidence.
+strict check exits zero. A failed marker, recovery journal, or delivery lock
+makes both commands fail before accepting the preserved HTML; report the
+diagnostics and complete a successful recovery delivery before collecting new
+visual evidence.
 
 The delivery interface exposes three separate claims:
 

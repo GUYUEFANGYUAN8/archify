@@ -821,7 +821,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   }
 });
 
-test('cli: concurrent deliveries cannot replace the active attempt ownership', async () => {
+test('cli: concurrent deliveries cannot replace the active attempt ownership', async (t) => {
   const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
   const out = path.join(tmp, 'concurrent-delivery.html');
@@ -844,6 +844,13 @@ process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow',
 await import(${JSON.stringify(pathToFileURL(cli).href)});
 `);
   const active = spawn(process.execPath, [wrapper], { cwd: skillRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  const activeExitPromise = new Promise((resolve) => {
+    active.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  t.after(() => {
+    if (!fs.existsSync(release)) fs.writeFileSync(release, 'release');
+    if (active.exitCode === null && active.signalCode === null) active.kill();
+  });
   let activeStdout = '';
   let activeStderr = '';
   active.stdout.on('data', (chunk) => { activeStdout += chunk; });
@@ -861,7 +868,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal('provenance' in rejection, false);
 
   fs.writeFileSync(release, 'release');
-  const activeExit = await new Promise((resolve) => active.once('close', (code, signal) => resolve({ code, signal })));
+  const activeExit = await activeExitPromise;
   assert.deepEqual(activeExit, { code: 0, signal: null }, activeStderr);
   const activeReceipt = JSON.parse(activeStdout);
   const provenance = JSON.parse(fs.readFileSync(out.replace(/\.html$/, '.delivery.json'), 'utf8'));
@@ -919,6 +926,17 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     assert.equal(receipt.diagnostics[0].code, 'delivery/lock-acquire');
     assert.equal(receipt.diagnostics[0].evidence.systemCode, 'ENOSPC');
     assert.equal(sha256(out), previousHash);
+    const expectedProvenanceCode = failureMode === 'replacement'
+      ? /^delivery\/provenance-locked$/
+      : /^delivery\/provenance-failed$/;
+    for (const args of [
+      ['check', out],
+      ['check', out, '--require-provenance'],
+    ]) {
+      const checked = run(args);
+      assert.equal(checked.status, 1, checked.stderr || checked.stdout);
+      assertCheckFailureReceipt(JSON.parse(checked.stdout), out, expectedProvenanceCode);
+    }
     if (failureMode === 'replacement') {
       assert.equal(fs.readFileSync(lockPath, 'utf8'), 'unrelated replacement');
       assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 1);
@@ -949,17 +967,38 @@ test('cli: delivery lock cannot replace its input specification', () => {
   assert.equal(JSON.parse(result.stdout).diagnostics[0].code, 'delivery/lock-path-conflict');
 });
 
-test('cli: delivery preserves unrecognized JSON at the lock path', () => {
-  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+test('cli: an unrecognized delivery lock preserves user data and invalidates the previous artifact', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
   const out = path.join(tmp, 'unrecognized-lock.html');
   const lock = out.replace(/\.html$/, '.delivery-lock.json');
   const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, sentinel: 'user data' }));
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const previousHash = sha256(out);
   fs.writeFileSync(lock, bytes);
-  const result = run(['deliver', 'workflow', input, out, '--json']);
+  const result = run(['deliver', 'workflow', replacementInput, out, '--json']);
   assert.equal(result.status, 1);
   assert.deepEqual(fs.readFileSync(lock), bytes);
-  assert.equal(fs.existsSync(out), false);
+  assert.equal(sha256(out), previousHash);
   assert.equal(JSON.parse(result.stdout).diagnostics[0].code, 'delivery/lock-invalid');
+  for (const args of [
+    ['check', out],
+    ['check', out, '--require-provenance'],
+  ]) {
+    const checked = run(args);
+    assert.equal(checked.status, 1, checked.stderr || checked.stdout);
+    assertCheckFailureReceipt(JSON.parse(checked.stdout), out, /^delivery\/provenance-locked$/);
+  }
+  for (const args of [
+    ['visual-check', out, '--json'],
+    ['visual-check', out, '--json', '--require-provenance'],
+  ]) {
+    const checked = run(args);
+    assert.equal(checked.status, 1, checked.stderr || checked.stdout);
+    const receipt = JSON.parse(checked.stdout);
+    assert.equal(receipt.provenance, 'locked');
+    assert.equal(receipt.diagnostics[0].code, 'delivery/provenance-locked');
+  }
 });
 
 test('cli: delivery provenance cannot replace its input specification', () => {
