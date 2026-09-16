@@ -27,17 +27,29 @@ test('skill keeps deterministic delivery, automated browser evidence, and percep
 });
 
 test('strict provenance check must succeed before visual-check', () => {
-  const checkCommand = 'node bin/archify.mjs check <output.html> --require-provenance';
-  const visualCheckCommand = 'node bin/archify.mjs visual-check <output.html> --json --require-provenance';
+  const workflows = [
+    {
+      name: 'SKILL.md',
+      section: skill.match(/After `deliver` exits zero, require current delivery evidence before handoff:[\s\S]*?node bin\/archify\.mjs visual-check <output\.html> --json --require-provenance/)?.[0] ?? '',
+      check: 'node bin/archify.mjs check <output.html> --require-provenance',
+      visualCheck: 'node bin/archify.mjs visual-check <output.html> --json --require-provenance',
+    },
+    {
+      name: 'delivery contract',
+      section: delivery.match(/Run strict `check` after `deliver` exits zero\.[\s\S]*?before collecting new\s+visual evidence\./)?.[0] ?? '',
+      check: 'strict `check`',
+      visualCheck: '`visual-check`',
+    },
+  ];
 
-  for (const [name, source] of [['SKILL.md', skill], ['delivery contract', delivery]]) {
-    const checkIndex = source.indexOf(checkCommand);
-    const visualCheckIndex = source.indexOf(visualCheckCommand);
+  for (const { name, section, check, visualCheck } of workflows) {
+    const checkIndex = section.indexOf(check);
+    const visualCheckIndex = section.indexOf(visualCheck);
 
     assert.notEqual(checkIndex, -1, `${name}: strict check command is documented`);
     assert.ok(checkIndex < visualCheckIndex, `${name}: strict check command precedes visual-check`);
     assert.match(
-      source,
+      section,
       /(?:after the strict `check` above exits zero[\s\S]{0,300}visual-check|visual-check`? only after that\s+strict check exits zero)/i,
       `${name}: visual-check requires a successful strict check`,
     );
