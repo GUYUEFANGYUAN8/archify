@@ -64,13 +64,21 @@ node bin/archify.mjs deliver <type> <candidate.json> <output.html> --quality sho
 Deliver reads the specification once, writes those exact bytes to a private same-directory candidate snapshot, renders that snapshot, runs the complete artifact checker, and only replaces the target after all artifact checks pass. The JSON receipt includes SHA-256 and byte counts for both `specification` and `artifact`.
 
 The pair commit is recoverable, not a claim that two filesystem paths change
-atomically or are durable across power loss. A caught commit exception rolls
-back when possible. A process interruption can leave the journal, backups, or
+atomically or are durable across power loss. Journal finalization is part of
+that commit: a caught failure while verifying or removing the journal rolls
+back the replaced files when possible. If restoration fails, the failure receipt
+identifies retained backups for recovery. A process interruption can leave the journal, backups, or
 private staging behind; checkers then fail closed. Rerun `deliver` serially on
 the same output to recover and establish a new current receipt, following any
 diagnostic that identifies abandoned private staging requiring cleanup. A
 failed attempt exits non-zero, never invokes an opener, and never authorizes
 visual evidence collection.
+
+Failure to initialize a delivery lock cleans up the lock created by that attempt
+when possible. Filesystem and cleanup errors are reported separately from an
+active concurrent delivery; an unrecognized existing lock is preserved for
+inspection. Fix the reported filesystem error before retrying, and use another
+output path if the lock path contains unrelated data.
 
 Run strict `check` after `deliver` exits zero. Run `visual-check` only after that
 strict check exits zero. A failed marker or recovery journal makes both commands

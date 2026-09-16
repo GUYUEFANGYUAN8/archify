@@ -38,12 +38,16 @@ function processIsRunning(pid) {
 function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias) {
   const lockPath = deliveryLockPath(output);
   if (pathsAlias(lockPath, inputPath)) {
-    throw new Error('Delivery lock path aliases the input specification; choose another output path.');
+    throw Object.assign(new Error('Delivery lock path aliases the input specification; choose another output path.'), {
+      deliveryLockCode: 'delivery/lock-path-conflict',
+    });
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let descriptor;
+    let createdLock;
     try {
       descriptor = fs.openSync(lockPath, 'wx', 0o600);
+      createdLock = fs.fstatSync(descriptor);
       fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, receiptId, pid: process.pid })}\n`);
       fs.closeSync(descriptor);
       descriptor = undefined;
@@ -58,7 +62,23 @@ function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias) {
         }
       };
     } catch (error) {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
+      if (descriptor !== undefined) {
+        try {
+          fs.closeSync(descriptor);
+        } catch (closeError) {
+          error.lockCleanupError = closeError.message;
+        }
+      }
+      if (createdLock) {
+        try {
+          const current = fs.lstatSync(lockPath);
+          // Only remove the entry this attempt created, never a replacement.
+          if (current.dev === createdLock.dev && current.ino === createdLock.ino) fs.unlinkSync(lockPath);
+        } catch (cleanupError) {
+          if (cleanupError.code !== 'ENOENT') error.lockCleanupError = cleanupError.message;
+        }
+        throw error;
+      }
       if (error.code !== 'EEXIST') throw error;
       let lock;
       try {
@@ -70,10 +90,14 @@ function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias) {
           throw new Error('Unrecognized delivery lock.');
         }
       } catch {
-        throw new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`);
+        throw Object.assign(new Error(`Unrecognized delivery lock at "${lockPath}"; inspect the existing entry before retrying.`), {
+          deliveryLockCode: 'delivery/lock-invalid',
+        });
       }
       if (processIsRunning(lock.pid)) {
-        throw new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`);
+        throw Object.assign(new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`), {
+          deliveryLockCode: 'delivery/concurrent-attempt',
+        });
       }
       try {
         fs.unlinkSync(lockPath);
@@ -754,7 +778,7 @@ function commitComparePair({ htmlCandidate, receiptCandidate, outputPath, receip
   }
 }
 
-function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, provenancePath, stagingDirectory }) {
+function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, provenancePath, stagingDirectory, receiptId }) {
   const targets = [
     { label: 'HTML artifact', target: outputPath, candidate: htmlCandidate, backup: path.join(stagingDirectory, '.previous-output') },
     { label: 'delivery provenance', target: provenancePath, candidate: provenanceCandidate, backup: path.join(stagingDirectory, '.previous-provenance') },
@@ -784,6 +808,12 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
       fs.renameSync(item.candidate, item.target);
       committed.push(item);
     }
+    // Finalization is part of the commit: keep the old files recoverable until
+    // the journal has been removed and checkers can accept the new artifact.
+    if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
+      throw new Error('Delivery ownership changed during commit; the pending journal was retained.');
+    }
+    fs.unlinkSync(deliveryPendingPath(outputPath));
   } catch (cause) {
     const rollbackErrors = [];
     for (const item of [...committed].reverse()) {
@@ -1405,15 +1435,26 @@ async function commandDeliver(args) {
       releaseDeliveryLock = acquireDeliveryLock(outputPath, receiptId, inputPath, pathsAlias);
     } catch (error) {
       const message = `Could not start delivery for "${outputPath}": ${error.message}`;
+      const code = error.deliveryLockCode || 'delivery/lock-acquire';
       reportArtifactFailure({
         command: 'deliver', json, stage: 'prepare', type, input: inputPath, output: outputPath, receiptId,
         error: message,
         diagnostics: [diagnostic({
-          code: 'delivery/concurrent-attempt',
-          message: 'Another delivery attempt already owns this output.',
+          code,
+          message,
           subject: { output: outputPath, lock: deliveryLockPath(outputPath) },
-          evidence: { reason: error.message },
-          supportedFixes: ['wait for the active delivery to finish, then retry'],
+          evidence: {
+            reason: error.message,
+            ...(error.code ? { systemCode: error.code } : {}),
+            ...(error.lockCleanupError ? { cleanupError: error.lockCleanupError } : {}),
+          },
+          supportedFixes: code === 'delivery/concurrent-attempt'
+            ? ['wait for the active delivery to finish, then retry']
+            : code === 'delivery/lock-path-conflict'
+              ? ['choose an output whose lock path is distinct from the input specification']
+              : code === 'delivery/lock-invalid'
+                ? ['inspect and preserve the unrecognized lock entry, or choose another output path']
+                : ['resolve the reported filesystem error and any lock cleanup error, then retry'],
         })],
       });
       return;
@@ -1673,11 +1714,8 @@ async function commandDeliver(args) {
         outputPath,
         provenancePath,
         stagingDirectory,
+        receiptId,
       });
-      if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
-        throw new Error('Delivery ownership changed during commit; the pending journal was retained.');
-      }
-      fs.unlinkSync(deliveryPendingPath(outputPath));
     } catch (error) {
       recoveryRequired = error.deliveryCommitDetails?.recoveryRequired === true;
       const message = `Could not commit verified delivery "${outputPath}": ${error.message}`;
