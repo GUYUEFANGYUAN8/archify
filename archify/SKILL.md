@@ -106,7 +106,7 @@ Read `references/delivery-contract.md` whenever `deliver`, strict `check`, or
 the same output path needs another delivery. That file is the canonical source
 for provenance, serialization, recovery, receipt, and browser-evidence rules.
 
-After delivery, collect bounded desktop evidence without modifying or rerendering the trusted HTML:
+After the strict `check` above exits zero, collect bounded desktop evidence without modifying or rerendering the trusted HTML:
 
 ```bash
 node bin/archify.mjs visual-check <output.html> --json --require-provenance
