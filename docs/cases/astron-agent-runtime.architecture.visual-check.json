@@ -7,8 +7,8 @@
   "visualReview": "pending",
   "artifact": {
     "path": "docs/cases/astron-agent-runtime.architecture.html",
-    "sha256": "3ebff1abe09c2493a9c0fe52cf809ec7b645f6ad374528788fed77b7137d2fa4",
-    "bytes": 823463
+    "sha256": "c639680da07ba865c7cd7bba213177ab60c75f9745ef0b68885a65de0e86ef5b",
+    "bytes": 832082
   },
   "state": {
     "detail": "read",
