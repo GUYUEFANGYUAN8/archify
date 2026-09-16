@@ -14,12 +14,13 @@ const TYPES = new Set(['architecture', 'workflow', 'sequence', 'dataflow', 'life
 
 function usage() {
   return `Usage:
-  archify render <type> <input.json> [output.html] [--quality standard|showcase] [--repo-root path (architecture only)]
+  archify render <type> <input.json> [output.html] [--quality standard|showcase] [--repo-root path]
   archify compare architecture <base.json> <head.json> [output.html] [--receipt path] [--json] [--quality standard|showcase] [--repo-root path]
-  archify deliver <type> <input.json> [output.html] [--json] [--open] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify preview <type> <input.json> [output.html] [--no-open] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify validate <type> <input.json> [--json] [--layout-json] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify migrate workflow <old.json> <new.json> --to-schema 2 [--json]
+  archify deliver <type> <input.json> [output.html] [--json] [--open] [--quality standard|showcase] [--repo-root path]
+  archify preview <type> <input.json> [output.html] [--no-open] [--quality standard|showcase] [--repo-root path]
+  archify validate <type> <input.json> [--json] [--layout-json] [--quality standard|showcase] [--repo-root path]
+  archify migrate workflow <old.json> <new.json> --to-schema 2 [--json] [--repo-root path]
+  archify atlas <manifest.json> <output.html> [--json]
   archify inspect <type> <input.json>
   archify check <output.html>
   archify visual-check <output.html> [--json] [--out-dir <dir>]
@@ -296,16 +297,6 @@ function formatDiagnostics(error, diagnostics = []) {
       return `[${entry.code}] ${entry.message}${fix}`;
     }),
   ].join('\n');
-}
-
-function assertEvidenceType(type, repoRoot) {
-  if (repoRoot && type !== 'architecture') {
-    rejectCliArgument('--repo-root is currently supported for architecture diagrams only.', {
-      code: 'cli/unsupported-option',
-      subject: { option: '--repo-root', type },
-      supportedFixes: ['remove --repo-root or use an architecture diagram'],
-    });
-  }
 }
 
 function exitFrom(result) {
@@ -811,7 +802,6 @@ function commandRender(args) {
   if (unknown.length) fail(`Unknown render option "${unknown[0]}".`);
   const [type, input, output] = repoArgs.rest;
   if (!type || !input || repoArgs.rest.length > 3) fail(usage());
-  assertEvidenceType(type, repoArgs.repoRoot);
   const result = runNode([rendererPath(type), input, ...(output ? [output] : [])], {
     env: rendererEnv(qualityArgs.quality, repoArgs.repoRoot),
   });
@@ -896,7 +886,6 @@ async function commandDeliver(args) {
     code: 'cli/usage',
     supportedFixes: ['use: archify deliver <type> <input.json> [output.html] [options]'],
   });
-  assertEvidenceType(type, repoArgs.repoRoot);
   const renderer = rendererPath(type);
   const { resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
   const inputPath = path.resolve(input);
@@ -1261,7 +1250,6 @@ async function commandPreview(args) {
   const positional = repoArgs.rest.filter((arg) => !knownOptions.has(arg));
   const [type, input, output] = positional;
   if (!type || !input || positional.length > 3) fail(usage());
-  assertEvidenceType(type, repoArgs.repoRoot);
   rendererPath(type);
 
   let runPreview;
@@ -1735,7 +1723,8 @@ function extractMigrationOptions(args) {
 }
 
 async function commandMigrate(args) {
-  const options = extractMigrationOptions(args);
+  const repoArgs = extractRepoRootArgs(args);
+  const options = extractMigrationOptions(repoArgs.rest);
   const [type, sourceArgument, destinationArgument] = options.positional;
   if (
     type !== 'workflow'
@@ -1744,7 +1733,7 @@ async function commandMigrate(args) {
     || options.positional.length !== 3
     || options.toSchema !== '2'
   ) {
-    fail('Usage: archify migrate workflow <old.json> <new.json> --to-schema 2 [--json]');
+    fail('Usage: archify migrate workflow <old.json> <new.json> --to-schema 2 [--json] [--repo-root path]');
   }
 
   const sourcePath = path.resolve(sourceArgument);
@@ -1860,7 +1849,7 @@ async function commandMigrate(args) {
     fs.writeFileSync(candidatePath, destinationBytes, { flag: 'wx' });
     const render = runNode([rendererPath('workflow'), candidatePath, artifactPath], {
       stdio: 'pipe',
-      env: rendererEnv(activeQualityProfile, undefined, true),
+      env: rendererEnv(activeQualityProfile, repoArgs.repoRoot, true),
     });
     if (render.status !== 0) {
       const failure = rendererFailure(render);
@@ -1978,7 +1967,6 @@ function commandValidate(args) {
     code: 'cli/usage',
     supportedFixes: ['use: archify validate <type> <input.json> [options]'],
   });
-  assertEvidenceType(type, repoRoot);
   const renderer = rendererPath(type);
 
   if (layoutJson && !['architecture', 'workflow'].includes(type)) {
@@ -2131,6 +2119,9 @@ try {
       break;
     case 'check':
       commandCheck(args);
+      break;
+    case 'atlas':
+      (await import('./atlas.mjs')).commandAtlas(args);
       break;
     case 'visual-check':
       await commandVisualCheck(args);
