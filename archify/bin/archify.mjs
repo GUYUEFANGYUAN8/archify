@@ -849,6 +849,7 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
     fs.unlinkSync(deliveryPendingPath(outputPath));
   } catch (cause) {
     const rollbackErrors = [];
+    const recoverableBackups = [];
     for (const item of [...committed].reverse()) {
       try {
         fs.rmSync(item.target, { force: true });
@@ -862,16 +863,14 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
         fs.renameSync(item.backup, item.target);
       } catch (error) {
         rollbackErrors.push(`${item.label}: restore failed (${error.message})`);
+        // A failed rename leaves the backup at its source path. Record it here
+        // so a later filesystem probe cannot hide the need to retain recovery.
+        recoverableBackups.push({ label: item.label, path: item.backup });
       }
     }
     const error = new Error(rollbackErrors.length
       ? 'Delivery pair commit failed and its previous files could not be fully restored.'
       : 'Delivery pair commit failed; the previous files were restored.');
-    const recoverableBackups = rollbackErrors.length
-      ? backedUp
-        .filter((item) => pathEntryExists(item.backup))
-        .map((item) => ({ label: item.label, path: item.backup }))
-      : [];
     error.deliveryCommitDetails = {
       reason: cause.message,
       ...(rollbackErrors.length ? {

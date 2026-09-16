@@ -769,6 +769,56 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
 });
 
+test('cli: delivery pair rollback retains backups when recovery-path inspection fails', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-pair-recovery-inspection-failure.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const priorArtifact = fs.readFileSync(out);
+
+  const wrapper = path.join(tmp, 'fail-delivery-recovery-inspection.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const renameSync = fs.renameSync;
+const lstatSync = fs.lstatSync;
+let outputRestoreFailed = false;
+fs.renameSync = (source, target) => {
+  if (String(source).endsWith('delivery-provenance.json')) {
+    const error = new Error('injected provenance rename failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  if (String(source).endsWith('.previous-output') && String(target) === ${JSON.stringify(out)}) {
+    outputRestoreFailed = true;
+    const error = new Error('injected output restore failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  return renameSync(source, target);
+};
+fs.lstatSync = (target, options) => {
+  if (outputRestoreFailed && String(target).endsWith('.previous-output')) {
+    const error = new Error('injected recovery inspection failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  return lstatSync(target, options);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+  const result = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(result.status, 1);
+  const failure = JSON.parse(result.stdout);
+  const evidence = failure.diagnostics[0].evidence;
+  assert.equal(evidence.recoveryRequired, true);
+  assert.match(result.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.existsSync(evidence.recoveryDirectory), true);
+  const outputBackup = evidence.recoverableBackups.find((entry) => entry.label === 'HTML artifact');
+  assert.ok(outputBackup);
+  assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
+});
+
 test('cli: a process exit after HTML commit remains fail-closed until a successful rerun', () => {
   const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
