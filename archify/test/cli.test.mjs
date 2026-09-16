@@ -891,7 +891,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     assertCheckFailureReceipt(
       JSON.parse(checked.stdout),
       out,
-      /^delivery\/(?:provenance-pending|provenance-failed)$/,
+      /^delivery\/provenance-failed$/,
     );
   }
 
@@ -1293,14 +1293,14 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assertCheckFailureReceipt(
     JSON.parse(permissive.stdout),
     out,
-    /^delivery\/(?:provenance-pending|provenance-failed)$/,
+    /^delivery\/provenance-failed$/,
   );
   const strict = run(['check', out, '--require-provenance']);
   assert.equal(strict.status, 1);
   assertCheckFailureReceipt(
     JSON.parse(strict.stdout),
     out,
-    /^delivery\/(?:provenance-pending|provenance-failed)$/,
+    /^delivery\/provenance-failed$/,
   );
 });
 
@@ -1375,7 +1375,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assertCheckFailureReceipt(
     JSON.parse(checked.stdout),
     out,
-    /^delivery\/(?:provenance-pending|provenance-failed)$/,
+    /^delivery\/provenance-failed$/,
   );
 });
 
@@ -1512,7 +1512,7 @@ test('cli: failed visual provenance preflight replaces stale evidence with a per
   assert.equal(receipt.command, 'visual-check');
   assert.equal(receipt.status, 'fail');
   assert.equal(receipt.artifact.path, path.resolve(out));
-  assert.match(receipt.diagnostics[0].code, /^delivery\/(?:provenance-pending|provenance-failed)$/);
+  assert.match(receipt.diagnostics[0].code, /^delivery\/provenance-failed$/);
   assert.equal(fs.existsSync(evidence.contactSheet), false);
   assert.equal(evidence.screenshots.every((file) => !fs.existsSync(file)), true);
   const persisted = JSON.parse(fs.readFileSync(evidence.receipt, 'utf8'));
