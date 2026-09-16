@@ -30,6 +30,7 @@ const testFiles = [
   'export-browser.test.mjs',
   'viewer-identifiers-browser.test.mjs',
   'repository-evidence.test.mjs',
+  'repository-evidence-types-browser.test.mjs',
 ];
 
 const chrome = findChrome();
