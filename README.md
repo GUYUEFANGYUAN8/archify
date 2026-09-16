@@ -253,7 +253,7 @@ Settings:
 
 Stable links can restore `#focus=<id>`, `#focus=<id>&reach=upstream|downstream`, `#relation=<id>`, `#route=<source>~<target>`, `#lens=<kind>~<kind>`, and `#view=<view-id>`. Reader-driven motion is finite, respects `prefers-reduced-motion`, and never enters canonical exports.
 
-The complete generation and viewer contract lives in [`archify/SKILL.md`](archify/SKILL.md).
+Generation and Viewer contracts: [`archify/SKILL.md`](archify/SKILL.md).
 
 ## Installation options
 
