@@ -9,8 +9,9 @@ import { ChromeVisualBrowser, findChrome } from '../bin/visual-check.mjs';
 import { createViewerClick } from './helpers/viewer-click.mjs';
 
 const skillRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const chrome = process.env.ARCHIFY_CHROME ? findChrome() : null;
-if (process.env.ARCHIFY_CHROME && !chrome) {
+const chromeConfigured = Object.prototype.hasOwnProperty.call(process.env, 'ARCHIFY_CHROME');
+const chrome = chromeConfigured ? findChrome() : null;
+if (chromeConfigured && !chrome) {
   throw new Error(`ARCHIFY_CHROME does not resolve to an executable browser: ${process.env.ARCHIFY_CHROME}`);
 }
 
