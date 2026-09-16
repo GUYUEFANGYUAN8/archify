@@ -310,6 +310,40 @@ test('visual-check rechecks delivery evidence after capture and discards screens
   assert.ok(outputs.screenshots.every((entry) => !fs.existsSync(entry.path)));
 });
 
+test('visual-check records cleanup errors after post-capture provenance failure', async () => {
+  const input = artifact('changed-with-uncleanable-browser-evidence.html');
+  const outputs = sidecarPaths(input);
+  let verificationCount = 0;
+  const result = await runVisualCheck({
+    artifactPath: input,
+    chromePath: '/fake/chrome',
+    deliveryProvenance: { status: 'current', receiptId: 'previous-receipt' },
+    verifyArtifact: () => {
+      verificationCount += 1;
+      if (verificationCount === 2) {
+        fs.rmSync(outputs.screenshots[0].path);
+        fs.mkdirSync(outputs.screenshots[0].path);
+        const error = new Error('Another delivery failed during capture.');
+        error.deliveryProvenance = { status: 'failed' };
+        error.archifyDiagnostics = [{ code: 'delivery/provenance-failed' }];
+        throw error;
+      }
+    },
+    browserFactory: async () => fakeBrowser(),
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.receipt.provenance, 'failed');
+  assert.deepEqual(result.receipt.diagnostics.map((entry) => entry.code), [
+    'delivery/provenance-failed',
+    'viewer/evidence-write',
+  ]);
+  assert.equal(result.receipt.diagnostics[1].evidence.errors[0].file, outputs.screenshots[0].path);
+  const saved = JSON.parse(fs.readFileSync(outputs.receipt));
+  assert.deepEqual(saved.diagnostics, result.receipt.diagnostics);
+  assert.equal(saved.status, 'fail');
+});
+
 test('visual-check returns 1 when the real reader projects node text below 6px', async () => {
   const input = artifact('unreadable.html');
   const result = await runVisualCheck({

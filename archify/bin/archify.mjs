@@ -150,8 +150,37 @@ function writeDeliveryProvenance(file, value) {
   }
 }
 
-function recordDeliveryFailure({ output, stage, input, error, receiptId, pathsAlias, attemptStarted }) {
+function recordDeliveryFailure(options) {
+  const {
+    output, stage, input, error, receiptId, pathsAlias, attemptStarted, lockOwned = false,
+  } = options;
   if (!output || !/\.html?$/i.test(output)) return { ok: true, status: 'not-applicable' };
+  if (!attemptStarted && !lockOwned) {
+    let releaseLock;
+    try {
+      releaseLock = acquireDeliveryLock(
+        output,
+        receiptId,
+        input,
+        pathsAlias,
+        (lockError) => recordDeliveryFailure({
+          ...options,
+          error: `Could not start delivery for "${output}": ${lockError.message}`,
+          lockOwned: true,
+        }),
+      );
+    } catch (lockError) {
+      return {
+        ...(lockError.deliveryFailureRecord || { ok: false, status: 'unrecorded' }),
+        lockError,
+      };
+    }
+    try {
+      return recordDeliveryFailure({ ...options, lockOwned: true });
+    } finally {
+      releaseLock();
+    }
+  }
   // Keep independent evidence even when the artifact is unreadable or the
   // provenance target is locked, aliases the input, or cannot be replaced.
   let journalError;
@@ -534,6 +563,27 @@ function diagnostic({ code, message, subject = {}, evidence = {}, supportedFixes
     evidence,
     supportedFixes,
   };
+}
+
+function deliveryLockFailureDiagnostic(output, error) {
+  const code = error.deliveryLockCode || 'delivery/lock-acquire';
+  return diagnostic({
+    code,
+    message: `Could not start delivery for "${output}": ${error.message}`,
+    subject: { output, lock: deliveryLockPath(output) },
+    evidence: {
+      reason: error.message,
+      ...(error.code ? { systemCode: error.code } : {}),
+      ...(error.lockCleanupError ? { cleanupError: error.lockCleanupError } : {}),
+    },
+    supportedFixes: code === 'delivery/concurrent-attempt'
+      ? ['wait for the active delivery to finish, then retry']
+      : code === 'delivery/lock-path-conflict'
+        ? ['choose an output whose lock path is distinct from the input specification']
+        : code === 'delivery/lock-invalid'
+          ? ['inspect and preserve the unrecognized lock entry, or choose another output path']
+          : ['resolve the reported filesystem error and any lock cleanup error, then retry'],
+  });
 }
 
 function inputDiagnostic(error, inputPath) {
@@ -1271,6 +1321,25 @@ function reportArtifactFailure({ command, json, stage, type, input, output, erro
 function writeDeliveryFailureReceipt(options) {
   const receiptId = options.receiptId || randomUUID();
   const recorded = recordDeliveryFailure({ ...options, receiptId });
+  if (recorded.lockError) {
+    const failureWasRecorded = Boolean(recorded.lockError.deliveryFailureRecord);
+    const lockBlocksFailureRecording = Boolean(recorded.lockError.deliveryLockCode);
+    reportArtifactFailure({
+      ...options,
+      command: 'deliver',
+      receiptId,
+      error: lockBlocksFailureRecording
+        ? `Could not start delivery for "${options.output}": ${recorded.lockError.message}`
+        : options.error,
+      ...(failureWasRecorded ? { provenance: recorded.status } : {}),
+      diagnostics: [
+        ...(!lockBlocksFailureRecording ? (options.diagnostics || []) : []),
+        deliveryLockFailureDiagnostic(options.output, recorded.lockError),
+        ...(recorded.diagnostic ? [recorded.diagnostic] : []),
+      ],
+    });
+    return;
+  }
   const diagnostics = [
     ...(options.diagnostics || []),
     ...(recorded.diagnostic ? [recorded.diagnostic] : []),
@@ -1345,7 +1414,14 @@ async function commandDeliver(args) {
   const { pathsAlias, resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
   const receiptId = randomUUID();
   let attemptStarted = false;
-  const reportDeliveryFailure = (options) => writeDeliveryFailureReceipt({ ...options, pathsAlias, receiptId, attemptStarted });
+  let releaseDeliveryLock;
+  const reportDeliveryFailure = (options) => writeDeliveryFailureReceipt({
+    ...options,
+    pathsAlias,
+    receiptId,
+    attemptStarted,
+    lockOwned: Boolean(releaseDeliveryLock),
+  });
   const inputPath = path.resolve(input);
   let specification;
   let diagram;
@@ -1462,7 +1538,6 @@ async function commandDeliver(args) {
   const specificationSnapshotPath = path.join(stagingDirectory, 'specification.snapshot.json');
   const provenanceCandidatePath = path.join(stagingDirectory, 'delivery-provenance.json');
   let recoveryRequired = false;
-  let releaseDeliveryLock;
 
   try {
     try {
@@ -1479,34 +1554,18 @@ async function commandDeliver(args) {
           receiptId,
           pathsAlias,
           attemptStarted,
+          lockOwned: true,
         }),
       );
     } catch (error) {
       const message = `Could not start delivery for "${outputPath}": ${error.message}`;
-      const code = error.deliveryLockCode || 'delivery/lock-acquire';
       const recorded = error.deliveryFailureRecord;
       reportArtifactFailure({
         command: 'deliver', json, stage: 'prepare', type, input: inputPath, output: outputPath, receiptId,
         error: message,
         ...(recorded ? { provenance: recorded.status } : {}),
         diagnostics: [
-          diagnostic({
-            code,
-            message,
-            subject: { output: outputPath, lock: deliveryLockPath(outputPath) },
-            evidence: {
-              reason: error.message,
-              ...(error.code ? { systemCode: error.code } : {}),
-              ...(error.lockCleanupError ? { cleanupError: error.lockCleanupError } : {}),
-            },
-            supportedFixes: code === 'delivery/concurrent-attempt'
-              ? ['wait for the active delivery to finish, then retry']
-              : code === 'delivery/lock-path-conflict'
-                ? ['choose an output whose lock path is distinct from the input specification']
-                : code === 'delivery/lock-invalid'
-                  ? ['inspect and preserve the unrecognized lock entry, or choose another output path']
-                  : ['resolve the reported filesystem error and any lock cleanup error, then retry'],
-          }),
+          deliveryLockFailureDiagnostic(outputPath, error),
           ...(recorded?.diagnostic ? [recorded.diagnostic] : []),
         ],
       });

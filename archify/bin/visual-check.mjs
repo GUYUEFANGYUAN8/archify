@@ -852,7 +852,6 @@ export async function runVisualCheck({
     persistReceipt(outputs, receipt);
     return { exitCode: receipt.ok ? EXIT.pass : EXIT.fail, receipt };
   } catch (error) {
-    cleanupCaptureSidecars(outputs);
     receipt.status = 'fail';
     receipt.ok = false;
     receipt.error = error.message;
@@ -870,8 +869,7 @@ export async function runVisualCheck({
       evidence: { reason: error.message },
       supportedFixes: ['resolve the reported Chrome inspection error, then rerun visual-check'],
     })];
-    persistReceipt(outputs, receipt);
-    return { exitCode: EXIT.fail, receipt };
+    return { exitCode: EXIT.fail, receipt: persistVisualCheckFailure(artifact, receipt) };
   } finally {
     if (browser?.close) await browser.close();
   }

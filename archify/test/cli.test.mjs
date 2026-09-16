@@ -927,6 +927,119 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(fs.existsSync(out.replace(/\.html$/, '.delivery-lock.json')), false);
 });
 
+test('cli: a pre-lock failure cannot replace an active delivery attempt', async (t) => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'concurrent-pre-lock-failure.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const initialProvenance = fs.readFileSync(out.replace(/\.html$/, '.delivery.json'), 'utf8');
+  const ready = path.join(tmp, 'concurrent-pre-lock-failure.ready');
+  const release = path.join(tmp, 'concurrent-pre-lock-failure.release');
+  const activeWrapper = path.join(tmp, 'hold-active-pre-lock-delivery.mjs');
+  fs.writeFileSync(activeWrapper, `
+import fs from 'node:fs';
+const writeFileSync = fs.writeFileSync;
+fs.writeFileSync = (file, value, options) => {
+  const result = writeFileSync(file, value, options);
+  if (String(file).endsWith('specification.snapshot.json')) {
+    writeFileSync(${JSON.stringify(ready)}, 'ready');
+    while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+  const active = spawn(process.execPath, [activeWrapper], { cwd: skillRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  const activeExitPromise = new Promise((resolve) => {
+    active.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  t.after(() => {
+    if (!fs.existsSync(release)) fs.writeFileSync(release, 'release');
+    if (active.exitCode === null && active.signalCode === null) active.kill();
+  });
+  let activeStdout = '';
+  let activeStderr = '';
+  active.stdout.on('data', (chunk) => { activeStdout += chunk; });
+  active.stderr.on('data', (chunk) => { activeStderr += chunk; });
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(ready) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(fs.existsSync(ready), true, 'active delivery did not reach the overlap point');
+  const activePending = fs.readFileSync(deliveryPendingPath(out), 'utf8');
+
+  const failingWrapper = path.join(tmp, 'fail-before-delivery-lock.mjs');
+  fs.writeFileSync(failingWrapper, `
+import fs from 'node:fs';
+const mkdtempSync = fs.mkdtempSync;
+fs.mkdtempSync = (prefix, options) => {
+  if (String(prefix).endsWith('.archify-delivery-')) {
+    const error = new Error('injected candidate setup failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  return mkdtempSync(prefix, options);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(initialInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+  const rejected = spawnSync(process.execPath, [failingWrapper], { cwd: skillRoot, encoding: 'utf8' });
+  const rejection = JSON.parse(rejected.stdout);
+  const pendingAfterRejection = fs.readFileSync(deliveryPendingPath(out), 'utf8');
+  const provenanceAfterRejection = fs.readFileSync(out.replace(/\.html$/, '.delivery.json'), 'utf8');
+
+  fs.writeFileSync(release, 'release');
+  const activeExit = await activeExitPromise;
+
+  assert.equal(rejected.status, 1);
+  assert.equal(rejection.diagnostics[0].code, 'delivery/concurrent-attempt');
+  assert.equal('provenance' in rejection, false);
+  assert.equal(pendingAfterRejection, activePending);
+  assert.equal(provenanceAfterRejection, initialProvenance);
+  assert.deepEqual(activeExit, { code: 0, signal: null }, activeStderr);
+  assert.equal(JSON.parse(activeStdout).ok, true);
+});
+
+test('cli: a pre-lock failure recovers a stale delivery lock before recording provenance', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'stale-lock-pre-lock-failure.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const exited = spawnSync(process.execPath, ['-e', '']);
+  assert.equal(exited.status, 0);
+  fs.writeFileSync(lockPath, `${JSON.stringify({
+    schemaVersion: 1,
+    receiptId: '00000000-0000-4000-8000-000000000000',
+    pid: exited.pid,
+  })}\n`);
+  const wrapper = path.join(tmp, 'fail-after-stale-delivery-lock.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const mkdtempSync = fs.mkdtempSync;
+fs.mkdtempSync = (prefix, options) => {
+  if (String(prefix).endsWith('.archify-delivery-')) {
+    const error = new Error('injected candidate setup failure');
+    error.code = 'EACCES';
+    throw error;
+  }
+  return mkdtempSync(prefix, options);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/prepare-candidate');
+  assert.equal(receipt.provenance, 'failed');
+  assert.equal(JSON.parse(fs.readFileSync(out.replace(/\.html$/, '.delivery.json'))).status, 'failed');
+  assert.equal(fs.existsSync(deliveryPendingPath(out)), true);
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
 for (const failureMode of ['empty-write', 'partial-write', 'close', 'replacement', 'cleanup-failure']) {
   test(`cli: failed lock initialization is cleaned up and delivery can retry (${failureMode})`, () => {
     const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
