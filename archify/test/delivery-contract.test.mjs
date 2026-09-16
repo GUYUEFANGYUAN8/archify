@@ -26,6 +26,24 @@ test('skill keeps deterministic delivery, automated browser evidence, and percep
   assert.match(delivery, /manual browser record[\s\S]*all four exact viewport measurements, both endpoint themes, and an artifact-bound record/i);
 });
 
+test('strict provenance check must succeed before visual-check', () => {
+  const checkCommand = 'node bin/archify.mjs check <output.html> --require-provenance';
+  const visualCheckCommand = 'node bin/archify.mjs visual-check <output.html> --json --require-provenance';
+
+  for (const [name, source] of [['SKILL.md', skill], ['delivery contract', delivery]]) {
+    const checkIndex = source.indexOf(checkCommand);
+    const visualCheckIndex = source.indexOf(visualCheckCommand);
+
+    assert.notEqual(checkIndex, -1, `${name}: strict check command is documented`);
+    assert.ok(checkIndex < visualCheckIndex, `${name}: strict check command precedes visual-check`);
+    assert.match(
+      source,
+      /(?:after the strict `check` above exits zero[\s\S]{0,300}visual-check|visual-check`? only after that\s+strict check exits zero)/i,
+      `${name}: visual-check requires a successful strict check`,
+    );
+  }
+});
+
 test('handoff browser evidence mirrors only the automated visual-check outcome', () => {
   assert.match(delivery, /`browser_evidence`[\s\S]*records only the outcome of this automated command/i);
   assert.match(delivery, /`passed`[\s\S]*exit 0[\s\S]*receipt `status: "pass"`/i);
