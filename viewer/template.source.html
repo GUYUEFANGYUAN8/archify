@@ -1795,13 +1795,39 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       font-size: 0.625rem;
     }
     .relationship-lens-head {
+      position: relative;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       align-items: start;
       gap: 0.75rem;
-      padding: 0.7rem 0.75rem 0.65rem;
+      padding: 1rem 0.75rem 0.65rem;
       border-bottom: 1px solid var(--toolbar-border);
       background: linear-gradient(120deg, color-mix(in srgb, var(--frontend-fill) 34%, transparent), transparent 72%);
+    }
+    .relationship-lens-drag-handle {
+      position: absolute;
+      top: 0.12rem;
+      left: 50%;
+      width: 2.5rem;
+      height: 0.78rem;
+      padding: 0 !important;
+      transform: translateX(-50%);
+      color: var(--text-faint) !important;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+    }
+    .relationship-lens-drag-handle::before {
+      content: "";
+      display: block;
+      width: 1.25rem;
+      margin: auto;
+      border-top: 2px dotted currentColor;
+      opacity: 0.72;
+    }
+    .focus-chip[data-panel-dragging="true"] .relationship-lens-drag-handle { cursor: grabbing; }
+    @media (hover: none), (pointer: coarse) {
+      .relationship-lens-drag-handle { display: none; }
     }
     .relationship-lens-copy { min-width: 0; }
     .relationship-lens-actions {
@@ -3809,6 +3835,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         width: calc(100% - 1rem);
         max-width: none;
       }
+      .relationship-lens-head { padding-top: 0.7rem; }
+      .relationship-lens-drag-handle { display: none; }
       .relationship-lens-list { max-height: min(12rem, 38vh); }
       .relationship-lens-actions #btn-focus-relations { display: block; color: var(--database-stroke); }
       .focus-chip:not([data-relations-expanded="true"]) .relationship-lens-head { border-bottom-color: transparent; }
@@ -5363,6 +5391,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       </div>
       <div class="focus-chip relationship-lens no-print" id="focus-chip" hidden role="region" aria-labelledby="relationship-lens-title">
         <div class="relationship-lens-head">
+          <button class="relationship-lens-drag-handle" id="btn-focus-move" type="button" data-focus-drag-handle aria-label="{{i18n:viewer.passport.move}}" title="{{i18n:viewer.passport.move}}"></button>
           <div class="relationship-lens-copy">
             <span class="relationship-lens-eyebrow">{{i18n:viewer.passport.eyebrow}}</span>
             <strong class="relationship-lens-title" id="relationship-lens-title"><span id="focus-label"></span></strong>
