@@ -56,10 +56,11 @@ function screenshotKey(width, height, theme) {
   return `${width}x${height}:${theme}`;
 }
 
-export function sidecarPaths(artifactPath) {
+export function sidecarPaths(artifactPath, { outDir } = {}) {
   const artifact = path.resolve(artifactPath);
-  const stem = artifact.replace(/\.html?$/i, '');
-  const base = `${stem}.visual-check`;
+  const stem = path.basename(artifact).replace(/\.html?$/i, '');
+  const directory = outDir ? path.resolve(outDir) : path.dirname(artifact);
+  const base = path.join(directory, `${stem}.visual-check`);
   const screenshots = CAPTURE_VIEWPORTS.flatMap(({ width, height }) => THEMES.map((theme) => ({
     width,
     height,
@@ -718,6 +719,8 @@ function baseReceipt({ artifactPath, artifact, outputs, chrome, deliveryProvenan
     viewerChrome: { status: 'fail', viewports: [] },
     captures: { status: 'fail', screenshots: [], contactSheet: null },
     sidecars: {
+      ...(path.dirname(outputs.receipt) !== path.dirname(artifactPath)
+        ? { directory: path.dirname(outputs.receipt) } : {}),
       receipt: path.basename(outputs.receipt),
       contactSheet: path.basename(outputs.contactSheet),
     },
@@ -728,16 +731,24 @@ function persistReceipt(outputs, receipt) {
   writeAtomic(outputs.receipt, `${JSON.stringify(receipt, null, 2)}\n`);
 }
 
-export function persistVisualCheckFailure(artifactPath, failure) {
-  const outputs = sidecarPaths(artifactPath);
+export function persistVisualCheckFailure(artifactPath, failure, { outDir } = {}) {
+  const outputs = sidecarPaths(artifactPath, { outDir });
   const receipt = {
     ...failure,
     ok: false, status: 'fail',
     containment: { status: 'fail', viewports: [] },
     captures: { status: 'fail', screenshots: [], contactSheet: null },
-    sidecars: { receipt: path.basename(outputs.receipt), contactSheet: path.basename(outputs.contactSheet) },
+    sidecars: {
+      ...(path.dirname(outputs.receipt) !== path.dirname(path.resolve(artifactPath))
+        ? { directory: path.dirname(outputs.receipt) } : {}),
+      receipt: path.basename(outputs.receipt),
+      contactSheet: path.basename(outputs.contactSheet),
+    },
   };
   const errors = [];
+  try { fs.mkdirSync(path.dirname(outputs.receipt), { recursive: true }); } catch (error) {
+    errors.push({ file: path.dirname(outputs.receipt), reason: error.message });
+  }
   for (const file of [outputs.receipt, outputs.contactSheet, ...outputs.screenshots.map((entry) => entry.path)]) {
     try { fs.rmSync(file, { force: true }); } catch (error) { errors.push({ file, reason: error.message }); }
   }
@@ -760,6 +771,7 @@ export function persistVisualCheckFailure(artifactPath, failure) {
 
 export async function runVisualCheck({
   artifactPath,
+  outDir,
   chromePath,
   resolveChrome = findChrome,
   browserFactory = async (resolvedChrome) => new ChromeVisualBrowser(resolvedChrome),
@@ -770,6 +782,8 @@ export async function runVisualCheck({
   const artifact = path.resolve(artifactPath);
   if (!/\.html?$/i.test(artifact)) throw new Error('visual-check requires an .html artifact.');
   const artifactBytes = fs.readFileSync(artifact);
+  const outputs = sidecarPaths(artifact, { outDir });
+  fs.mkdirSync(path.dirname(outputs.receipt), { recursive: true });
   try {
     verifyArtifact?.(artifactBytes);
   } catch (error) {
@@ -778,9 +792,8 @@ export async function runVisualCheck({
       artifact: { path: artifact, sha256: sha256(artifactBytes), bytes: artifactBytes.byteLength },
       provenance: error.deliveryProvenance?.status, error: error.message,
       diagnostics: error.archifyDiagnostics || [],
-    }) };
+    }, { outDir }) };
   }
-  const outputs = sidecarPaths(artifact);
   cleanupCaptureSidecars(outputs);
   safeUnlink(outputs.receipt);
 
@@ -902,7 +915,7 @@ export async function runVisualCheck({
       evidence: { reason: error.message },
       supportedFixes: ['resolve the reported Chrome inspection error, then rerun visual-check'],
     })];
-    return { exitCode: EXIT.fail, receipt: persistVisualCheckFailure(artifact, receipt) };
+    return { exitCode: EXIT.fail, receipt: persistVisualCheckFailure(artifact, receipt, { outDir }) };
   } finally {
     if (browser?.close) await browser.close();
   }

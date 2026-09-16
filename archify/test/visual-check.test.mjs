@@ -215,6 +215,51 @@ test('visual-check records four containment viewports and four endpoint theme ca
   }
 });
 
+test('sidecarPaths places outputs in outDir instead of beside the artifact', () => {
+  const input = artifact('outdir-source.html');
+  const separateDir = path.join(tmp, 'evidence-nested', 'deeper');
+  assert.equal(fs.existsSync(separateDir), false, 'precondition: outDir must not exist yet');
+
+  const outputs = sidecarPaths(input, { outDir: separateDir });
+
+  assert.equal(fs.existsSync(separateDir), false, 'calculating paths must not create directories');
+  assert.equal(path.dirname(outputs.receipt), separateDir);
+  assert.equal(path.dirname(outputs.contactSheet), separateDir);
+  assert.equal(outputs.screenshots.every((entry) => path.dirname(entry.path) === separateDir), true);
+  assert.equal(path.basename(outputs.receipt), 'outdir-source.visual-check.json');
+
+  // Omitting outDir keeps the existing beside-the-artifact behavior unchanged.
+  const defaultOutputs = sidecarPaths(input);
+  assert.equal(path.dirname(defaultOutputs.receipt), path.dirname(input));
+});
+
+test('visual-check writes all sidecars into --out-dir end-to-end, none beside the artifact', async () => {
+  const input = artifact('outdir-e2e.html');
+  const outDir = path.join(tmp, 'outdir-e2e-evidence');
+  const browser = fakeBrowser();
+  const result = await runVisualCheck({
+    artifactPath: input,
+    outDir,
+    chromePath: '/fake/chrome',
+    browserFactory: async () => browser,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.receipt.status, 'pass');
+
+  const outputs = sidecarPaths(input, { outDir });
+  assert.equal(result.receipt.sidecars.directory, outDir);
+  assert.equal(fs.existsSync(path.join(result.receipt.sidecars.directory, result.receipt.sidecars.receipt)), true);
+  assert.equal(fs.existsSync(path.join(result.receipt.sidecars.directory, result.receipt.captures.contactSheet)), true);
+  assert.equal(fs.existsSync(outputs.receipt), true);
+  assert.equal(fs.existsSync(outputs.contactSheet), true);
+  assert.equal(outputs.screenshots.every((entry) => fs.existsSync(entry.path)), true);
+
+  const besideArtifact = sidecarPaths(input);
+  assert.equal(fs.existsSync(besideArtifact.receipt), false, 'no sidecar should land beside the artifact when outDir is set');
+  assert.equal(fs.existsSync(besideArtifact.contactSheet), false);
+});
+
 test('visual-check returns 1 and preserves evidence when any viewport overflows', async () => {
   const input = artifact('overflow.html');
   const result = await runVisualCheck({
@@ -245,12 +290,15 @@ test('visual-check returns 1 and preserves evidence when any viewport overflows'
 
 test('visual-check refuses changed delivery evidence before launching a browser', async () => {
   const input = artifact('changed-before-browser.html');
-  const outputs = sidecarPaths(input);
+  const outDir = path.join(tmp, 'changed-before-browser-evidence');
+  const outputs = sidecarPaths(input, { outDir });
+  fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(outputs.contactSheet, 'old evidence');
   for (const entry of outputs.screenshots) fs.writeFileSync(entry.path, png);
   let launched = false;
   const result = await runVisualCheck({
     artifactPath: input,
+    outDir,
     verifyArtifact: () => {
       const error = new Error('delivery changed');
       error.deliveryProvenance = { status: 'mismatch' };
@@ -262,9 +310,11 @@ test('visual-check refuses changed delivery evidence before launching a browser'
   assert.equal(launched, false);
   assert.equal(result.exitCode, 1);
   assert.equal(result.receipt.provenance, 'mismatch');
+  assert.equal(result.receipt.sidecars.directory, outDir);
   assert.equal(JSON.parse(fs.readFileSync(outputs.receipt)).status, 'fail');
   assert.equal(fs.existsSync(outputs.contactSheet), false);
   assert.ok(outputs.screenshots.every((entry) => !fs.existsSync(entry.path)));
+  assert.equal(fs.existsSync(sidecarPaths(input).receipt), false);
 });
 
 test('visual-check persists cleanup errors in its failure receipt', () => {
