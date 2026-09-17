@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { collectAmbiguousCorridors, collectBorderRuns, collectLabelRouteClearance, collectRouteRhythmIssues, minimumLabelRouteClearance, routeBudgetMetrics } from '../renderers/shared/geometry.mjs';
+import { collectAmbiguousCorridors, collectBorderRuns, collectLabelCanvasOverflow, collectLabelRouteClearance, collectRouteRhythmIssues, describeLabelCanvasOverflow, formatRect, minimumLabelRouteClearance, routeBudgetMetrics } from '../renderers/shared/geometry.mjs';
 import {
   DESKTOP_READABILITY_VIEWPORT,
   DESKTOP_READER_DIAGRAM_WIDTH,
@@ -46,6 +46,7 @@ let composition = {
     containerBorderRuns: 0,
     labelRouteClearanceIssues: 0,
     minLabelRouteClearance: null,
+    labelCanvasOverflowIssues: 0,
     maxBends: 0,
     routesOverSuggestedBends: 0,
     maxStretch: null,
@@ -112,7 +113,7 @@ if (svgMatches.length === 1) {
   addCheck(
     'orthogonal_arrows',
     diagonal.length === 0,
-    diagonal.map(({ arrow, segmentIndex }) => `${arrow.kind} ${arrow.index} segment ${segmentIndex + 1}: ${arrow.raw}`),
+    diagonal.map(({ arrow, segmentIndex }) => `${arrow.kind} ${arrow.index} segment ${segmentIndex + 1}: expected an orthogonal segment or an explicitly authored direct straight route; ${arrow.raw}`),
   );
   const relationshipCrossings = collectRelationshipCrossings(arrows);
   const compositionFrames = collectCompositionFrames(beforeLegend);
@@ -144,21 +145,31 @@ if (svgMatches.length === 1) {
     routedRelations: arrows.map((arrow) => ({ relation: arrow, relationIndex: arrow.index, points: arrow.routePoints })),
     threshold: labelClearanceThreshold,
   });
+  // The renderers bound their own label rects, but `check` also re-measures an
+  // artifact it did not produce; see collectLabelCanvasOverflow in
+  // shared/geometry.mjs.
+  const labelCanvasOverflow = collectLabelCanvasOverflow({
+    labels: relationshipLabels,
+    viewBox: viewBoxRect(svgAttrs),
+  });
   const crossingIsError = qualityProfile === 'showcase';
   const corridorIsError = qualityProfile === 'showcase';
   const rhythmIsError = qualityProfile === 'showcase';
   const labelClearanceIsError = qualityProfile === 'showcase';
+  const labelContainmentIsError = qualityProfile === 'showcase';
   const desktopReadabilityIsError = qualityProfile === 'showcase';
   const compositionErrors = (qualityGatesEnforced ? containerBorderRuns.length : 0)
     + (crossingIsError ? relationshipCrossings.length : 0)
     + (corridorIsError ? ambiguousCorridors.length : 0)
     + (labelClearanceIsError ? labelRouteClearance.length : 0)
+    + (labelContainmentIsError ? labelCanvasOverflow.length : 0)
     + (rhythmIsError ? routeRhythmIssues.length : 0)
     + (desktopReadabilityIsError && desktopReadabilityIssue ? 1 : 0);
   const compositionWarnings = (qualityGatesEnforced ? 0 : containerBorderRuns.length)
     + (crossingIsError ? 0 : relationshipCrossings.length)
     + (corridorIsError ? 0 : ambiguousCorridors.length)
     + (labelClearanceIsError ? 0 : labelRouteClearance.length)
+    + (labelContainmentIsError ? 0 : labelCanvasOverflow.length)
     + (rhythmIsError ? 0 : routeRhythmIssues.length)
     + (desktopReadabilityIsError || !desktopReadabilityIssue ? 0 : 1);
   composition = {
@@ -174,6 +185,7 @@ if (svgMatches.length === 1) {
       ambiguousCorridors: ambiguousCorridors.length,
       containerBorderRuns: containerBorderRuns.length,
       labelRouteClearanceIssues: labelRouteClearance.length,
+      labelCanvasOverflowIssues: labelCanvasOverflow.length,
       minLabelRouteClearance: minimumLabelRouteClearance(labelRouteMeasurements),
       desktopReadabilityIssues: desktopReadabilityIssue ? 1 : 0,
       minProjectedNodeTextPx: desktopReadabilityIssue?.projectedFontPx ?? null,
@@ -206,6 +218,20 @@ if (svgMatches.length === 1) {
         from: hit.start.map((value) => Math.round(value * 10) / 10),
         to: hit.end.map((value) => Math.round(value * 10) / 10),
       })),
+      ...labelCanvasOverflow.map((hit) => {
+        const label = hit.label?.label || hit.relation?.label || '';
+        return {
+          severity: labelContainmentIsError ? 'error' : 'warning',
+          code: 'composition/label-canvas-containment',
+          label,
+          relationship: relationshipRecord(hit.relation),
+          labelRect: roundedRect(hit.rect),
+          viewBox: hit.viewBox,
+          viewBoxOrigin: hit.viewBoxOrigin,
+          overflowPx: hit.overflowPx,
+          detail: `[composition/label-canvas-containment] ${qualityProfile} label "${label}" on ${relationshipName(hit.relation)} extends past the ${describeLabelCanvasOverflow(hit)} (label rect ${formatRect(hit.rect)}; viewBox ${hit.viewBox[0]}x${hit.viewBox[1]}${hit.viewBoxOrigin.some(Boolean) ? ` at ${hit.viewBoxOrigin[0]},${hit.viewBoxOrigin[1]}` : ''}) — use renderer-supported label controls (shorten the label or reorder participants for sequence; otherwise labelAt, labelDx, labelDy, or labelSegment), or enlarge meta.viewBox.`,
+        };
+      }),
       ...relationshipCrossings.map((hit) => ({
         severity: crossingIsError ? 'error' : 'warning',
         code: 'composition/proper-crossing',
@@ -325,6 +351,12 @@ function collectArrows(fragment) {
       kind: tag[1].toLowerCase(),
       index: index += 1,
       raw,
+      // Trust route intent only for a semantic edge with one visible direct
+      // segment. A stale marker on bent/curved geometry cannot waive the gate.
+      authoredStraight: attrs['data-composition-route'] === 'straight'
+        && Boolean(attrs['data-edge-from'] && attrs['data-edge-to'])
+        && segments.length === 1 && borderSegments.length === 1
+        && (tag[1].toLowerCase() === 'line' || /^\s*M\s+[-+\d.eE]+\s+[-+\d.eE]+\s+L\s+[-+\d.eE]+\s+[-+\d.eE]+\s*$/.test(attrs.d || '')),
       segments,
       borderSegments,
       routePoints: parseRoutePoints(attrs['data-composition-points']) || (
@@ -586,6 +618,7 @@ function straightPathSegments(d) {
 }
 
 function diagonalStraightSegments(arrow) {
+  if (arrow.authoredStraight) return [];
   return arrow.borderSegments.flatMap(({ start, end }, segmentIndex) => (
     Math.abs(start[0] - end[0]) > 0.01 && Math.abs(start[1] - end[1]) > 0.01
       ? [{ segmentIndex, start, end }]
@@ -649,9 +682,19 @@ function textBox(attrs, text) {
   };
 }
 
-function collectDesktopReadability(svgAttrs, fragment) {
+// A foreign artifact may author a legal non-zero viewBox origin, so containment
+// needs all four numbers; sizing checks read the trailing pair.
+function viewBoxRect(svgAttrs) {
   const viewBox = String(svgAttrs.viewBox || '').trim().split(/[\s,]+/).map(Number);
-  const viewBoxWidth = viewBox.length === 4 ? viewBox[2] : Number.NaN;
+  return viewBox.length === 4 ? viewBox : [Number.NaN, Number.NaN, Number.NaN, Number.NaN];
+}
+
+function viewBoxSize(svgAttrs) {
+  return viewBoxRect(svgAttrs).slice(2);
+}
+
+function collectDesktopReadability(svgAttrs, fragment) {
+  const [viewBoxWidth] = viewBoxSize(svgAttrs);
   if (!Number.isFinite(viewBoxWidth) || viewBoxWidth <= 0) return null;
   const scale = Math.min(1, DESKTOP_READER_DIAGRAM_WIDTH / viewBoxWidth);
   let worst = null;

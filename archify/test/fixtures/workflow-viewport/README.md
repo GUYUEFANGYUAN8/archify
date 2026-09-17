@@ -4,14 +4,16 @@ Original task (Chinese): 用户提交订单，校验并预占库存，创建待�
 
 `order-overflow.workflow.json` is the final failed candidate from a Luna trial on
 PR #325 (`d634028`), after three layout repairs. Static showcase validation
-passed, but 1440×900 browser scrollHeight was 1499. This is a known failing
-browser fixture, not a recommended authoring example.
+passed, but 1440×900 browser scrollHeight was 1499. Height-aware fitting now contains this implicit stacked workflow without changing
+its SVG geometry. The original layout remains a historical regression fixture,
+not a recommended authoring example.
 
 `order-reflow.workflow.json` preserves its node business fields, edges, mainPath,
 semanticChecks, cards, phases and metadata. Only lane grouping, columns and
 vertical offsets differ. Both compile and deliver successfully. The browser
-regression proves the overflow yields measured lane evidence and that a semantic
-reflow can pass without weakening the gate. It blocks remote HTTP(S) resources
+regression verifies that both implicit layouts fit. A copy pinned to the historical
+`860×786` viewBox still yields measured lane-overflow evidence: authored canvases
+retain their geometry, and the diagnostic gate remains exercised. It blocks remote HTTP(S) resources
 for repeatable font conditions; it does not establish online font reliability.
 
 Rendered frame IDs are indices, not source ownership IDs. The diagnostic's

@@ -128,7 +128,8 @@ test('cli: help lists commands and diagram types', () => {
   assert.match(result.stdout, /archify preview <type>/);
   assert.match(result.stdout, /archify visual-check <output\.html>/);
   assert.match(result.stdout, /--open/);
-  assert.match(result.stdout, /--repo-root path \(architecture only\)/);
+  assert.match(result.stdout, /archify validate <type> <input\.json> .*\[--repo-root path\]/);
+  assert.doesNotMatch(result.stdout, /architecture only/);
   assert.match(result.stdout, /archify guide \[scenario or question\]/);
   assert.match(result.stdout, /archify doctor/);
   assert.match(result.stdout, /archify demo \[output-directory\]/);
@@ -1567,6 +1568,8 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   const receipt = JSON.parse(failed.stdout);
   assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
   assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.equal(receipt.diagnostics[0].evidence.commitError.reason, 'injected provenance commit failure');
+  assert.equal(receipt.diagnostics[0].evidence.commitError.systemCode, 'EACCES');
   assert.ok(receipt.diagnostics[0].evidence.recoverableBackups.length >= 1);
   const outputBackup = receipt.diagnostics[0].evidence.recoverableBackups
     .find((entry) => entry.label === 'HTML artifact');
@@ -1807,6 +1810,56 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(JSON.parse(strict.stdout).diagnostics[0].code, 'delivery/provenance-locked');
 });
 
+test('cli: portable delivery lock: failure-path release errors override the renderer status', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-failure-lock-release.html');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const previousHash = sha256(out);
+  const wrapper = path.join(tmp, 'delivery-failure-lock-release.mjs');
+  fs.writeFileSync(wrapper, `
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const spawnSync = childProcess.spawnSync;
+let rendererFailed = false;
+childProcess.spawnSync = (executable, args, options) => {
+  if (!rendererFailed && String(args?.[0]).includes('render-workflow.mjs')) {
+    rendererFailed = true;
+    return { status: 7, stdout: '', stderr: '' };
+  }
+  return spawnSync(executable, args, options);
+};
+syncBuiltinESMExports();
+const unlinkSync = fs.unlinkSync;
+fs.unlinkSync = (file, ...args) => {
+  if (String(file) === ${JSON.stringify(lockPath)}) {
+    throw Object.assign(new Error('injected failure-path lock release error'), { code: 'EACCES' });
+  }
+  return unlinkSync(file, ...args);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.ok, false);
+  assert.equal(receipt.stage, 'render');
+  assert.equal(receipt.provenance, 'failed');
+  assert.equal(receipt.diagnostics[0].code, 'delivery/lock-release');
+  assert.equal(receipt.diagnostics[1].code, 'internal/unclassified');
+  assert.doesNotMatch(receipt.diagnostics[0].message, /committed/i);
+  assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(fs.existsSync(pendingPath), true);
+  assert.equal(JSON.parse(fs.readFileSync(provenancePath, 'utf8')).status, 'failed');
+  assert.equal(sha256(out), previousHash);
+});
+
 test('cli: lock release failure does not invoke the requested opener', (t) => {
   if (process.platform === 'win32') {
     t.skip('fake open and xdg-open executables cover POSIX opener dispatch');
@@ -1845,7 +1898,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(fs.existsSync(fake.log), false);
 });
 
-for (const failureMode of ['empty-write', 'partial-write', 'close', 'replacement', 'cleanup-failure']) {
+for (const failureMode of ['empty-write', 'partial-write', 'close', 'replacement', 'zero-identity-replacement', 'cleanup-failure']) {
   test(`cli: failed lock initialization is cleaned up and delivery can retry (${failureMode})`, () => {
     const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
     const out = path.join(tmp, `lock-init-${failureMode}.html`);
@@ -1865,6 +1918,20 @@ fs.openSync = (file, ...args) => {
 const mode = ${JSON.stringify(failureMode)};
 const method = mode === 'close' ? 'closeSync' : 'writeFileSync';
 const original = fs[method];
+if (mode === 'zero-identity-replacement') {
+  const fstatSync = fs.fstatSync;
+  const lstatSync = fs.lstatSync;
+  fs.fstatSync = (descriptor, ...args) => {
+    const entry = fstatSync(descriptor, ...args);
+    return descriptor === lockDescriptor ? { ...entry, ino: 0 } : entry;
+  };
+  fs.lstatSync = (file, ...args) => {
+    const entry = lstatSync(file, ...args);
+    return String(file) === ${JSON.stringify(lockPath)}
+      ? { ...entry, ino: 0, isFile: () => entry.isFile() }
+      : entry;
+  };
+}
 if (mode === 'cleanup-failure') {
   const unlinkSync = fs.unlinkSync;
   fs.unlinkSync = (file, ...args) => {
@@ -1877,7 +1944,7 @@ fs[method] = (descriptor, ...args) => {
   if (descriptor === lockDescriptor && !injected) {
     injected = true;
     if (mode === 'partial-write') original(descriptor, '{');
-    if (mode === 'replacement') {
+    if (mode === 'replacement' || mode === 'zero-identity-replacement') {
       fs.renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owned`)});
       original(${JSON.stringify(lockPath)}, 'unrelated replacement');
     }
@@ -1891,19 +1958,20 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     const result = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
     assert.equal(result.status, 1, result.stderr || result.stdout);
     const receipt = JSON.parse(result.stdout);
-    const expectedDiagnostic = failureMode === 'replacement'
+    const replacementMode = failureMode === 'replacement' || failureMode === 'zero-identity-replacement';
+    const expectedDiagnostic = replacementMode
       ? 'delivery/ownership-lost'
       : failureMode === 'cleanup-failure'
         ? 'delivery/lock-release'
         : 'delivery/lock-acquire';
     assert.equal(receipt.diagnostics[0].code, expectedDiagnostic);
-    if (failureMode === 'replacement' || failureMode === 'cleanup-failure') {
+    if (replacementMode || failureMode === 'cleanup-failure') {
       assert.equal(receipt.diagnostics[0].evidence.initializationSystemCode, 'ENOSPC');
     } else {
       assert.equal(receipt.diagnostics[0].evidence.systemCode, 'ENOSPC');
     }
     assert.equal(sha256(out), previousHash);
-    const expectedProvenanceCode = failureMode === 'replacement'
+    const expectedProvenanceCode = replacementMode
       ? /^delivery\/provenance-locked$/
       : /^delivery\/provenance-failed$/;
     for (const args of [
@@ -1914,13 +1982,14 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
       assert.equal(checked.status, 1, checked.stderr || checked.stdout);
       assertCheckFailureReceipt(JSON.parse(checked.stdout), out, expectedProvenanceCode);
     }
-    if (failureMode === 'replacement') {
+    if (replacementMode) {
       assert.equal(fs.readFileSync(lockPath, 'utf8'), 'unrelated replacement');
       assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 1);
       return;
     }
     if (failureMode === 'cleanup-failure') {
       assert.equal(fs.existsSync(lockPath), true);
+      assert.equal(receipt.provenance, 'failed');
       assert.equal(receipt.diagnostics[0].evidence.systemCode, 'EACCES');
       assert.match(receipt.diagnostics[0].evidence.reason, /injected lock cleanup failure/);
       assert.doesNotMatch(receipt.diagnostics[0].message, /committed/i);
@@ -1944,6 +2013,29 @@ test('cli: delivery lock cannot replace its input specification', () => {
   assert.equal(fs.existsSync(out), false);
   assert.equal('provenance' in JSON.parse(result.stdout), false);
   assert.equal(JSON.parse(result.stdout).diagnostics[0].code, 'delivery/lock-path-conflict');
+});
+
+test('cli: portable delivery lock: a symlink lock is invalid even when it targets the input', (t) => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'symlink-lock-to-input.html');
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  try {
+    fs.symlinkSync(input, lockPath, 'file');
+  } catch (error) {
+    if (error.code === 'EPERM' || error.code === 'EACCES') {
+      t.skip('symlink creation requires permission');
+      return;
+    }
+    throw error;
+  }
+
+  const result = run(['deliver', 'workflow', input, out, '--json']);
+
+  assert.equal(result.status, 1, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).diagnostics[0].code, 'delivery/lock-invalid');
+  assert.equal(fs.lstatSync(lockPath).isSymbolicLink(), true);
+  assert.equal(fs.readlinkSync(lockPath), input);
+  assert.equal(fs.existsSync(out), false);
 });
 
 test('cli: an unrecognized delivery lock preserves user data and invalidates the previous artifact', () => {
@@ -2603,12 +2695,6 @@ test('cli: validate and deliver keep argument failures machine-readable with --j
       command: 'validate',
       code: 'cli/unknown-diagram-type',
       subject: { type: 'unknown' },
-    },
-    {
-      args: ['validate', 'workflow', workflow, '--repo-root', '.', '--json'],
-      command: 'validate',
-      code: 'cli/unsupported-option',
-      subject: { option: '--repo-root', type: 'workflow' },
     },
     {
       args: ['validate', 'architecture', workflow, '--repo-root=', '--json'],

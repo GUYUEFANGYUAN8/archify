@@ -8,6 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { ChromeVisualBrowser, findChrome } from '../bin/visual-check.mjs';
 
+import { translateMessage } from '../renderers/shared/i18n.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const skillRoot = path.resolve(__dirname, '..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'archify-semantic-passport-'));
@@ -184,6 +186,50 @@ test('semantic passport computes and applies target top synchronously on open an
   } finally {
     await browser.close().catch(() => {});
   }
+});
+
+test('committed lifecycle focus hides the non-semantic primary rail', () => {
+  const html = render('lifecycle', CASES.lifecycle);
+  const diagram = svg(html);
+  const rail = diagram.match(/<path\b[^>]*data-lifecycle-rail[^>]*>/)?.[0] || '';
+
+  assert.ok(rail, 'lifecycle: expected the primary decorative rail to be identifiable');
+  assert.doesNotMatch(rail, /data-edge-from|data-edge-to/, 'the rail must remain non-semantic');
+  assert.match(
+    html,
+    /svg\[data-focus-active\] \[data-lifecycle-rail\]\s*\{\s*opacity:\s*0;/,
+    'committed node focus must not expose the decorative rail through dimmed nodes',
+  );
+});
+
+test('Semantic Passport exposes one localized, bounded move affordance outside canonical export', () => {
+  const html = render('workflow', CASES.workflow);
+  const diagram = svg(html);
+
+  assert.match(
+    html,
+    /<button class="relationship-lens-drag-handle" id="btn-focus-move"[^>]+data-focus-drag-handle[^>]+aria-label="Move semantic passport\./,
+  );
+  assert.equal(translateMessage('en', 'viewer.passport.move'), 'Move semantic passport. Drag, use arrow keys, or press Home to reset.');
+  assert.equal(translateMessage('zh-CN', 'viewer.passport.move'), '移动语义护照。可拖动、使用方向键移动，或按 Home 恢复自动位置。');
+  assert.match(html, /\.relationship-lens-drag-handle\s*\{[\s\S]*cursor:\s*grab;[\s\S]*touch-action:\s*none;/);
+  assert.match(html, /\.focus-chip button:focus-visible,[\s\S]*outline:\s*2px solid var\(--frontend-stroke\);/);
+  assert.match(html, /@media \(hover: none\), \(pointer: coarse\)\s*\{\s*\.relationship-lens-drag-handle \{ display: none; \}/);
+  assert.match(html, /@media \(max-width: 720px\)[\s\S]*\.relationship-lens-drag-handle \{ display: none; \}/);
+  assert.match(html, /function manualLensPlacementAvailable\(\)[\s\S]*finePointerQuery\.matches/);
+  assert.match(html, /function beginLensDrag\(event\)/);
+  assert.match(html, /function moveLensDrag\(event\)/);
+  assert.match(html, /function finishLensDrag\(event, cancel\)/);
+  assert.match(html, /function resetLensPlacement\(options\)/);
+  assert.match(html, /function applyManualLensPosition\(position\)/);
+  assert.match(html, /Math\.hypot\(dx, dy\) <= 3/);
+  assert.match(html, /moveBtn\.setPointerCapture\(event\.pointerId\)/);
+  assert.match(html, /moveBtn\.addEventListener\('dblclick'/);
+  assert.match(html, /event\.key === 'Home'/);
+  assert.match(html, /var distance = event\.shiftKey \? 4 : 16/);
+  assert.match(html, /preserveLensPlacement: preserveLensPlacement/);
+  assert.match(html, /window\.addEventListener\('resize', requestLensPlacement\)/);
+  assert.doesNotMatch(diagram, /btn-focus-move|data-focus-drag-handle|data-manual-placement|data-panel-dragging/);
 });
 
 test('Node Finder searches and presents the same passport facts', () => {

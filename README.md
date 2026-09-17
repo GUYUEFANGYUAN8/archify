@@ -150,7 +150,7 @@ Continue with focused requests such as `add Redis`, `move auth to the left`, or 
 
 Architecture's optional `deployment-ownership` profile fails closed when authored owners, region placement, private database scope, or named crossings are missing; it is never implicit and does not inspect live infrastructure. See the [checked deployment proof](https://tt-a1i.github.io/archify/gallery.html#proof-deployment-ownership).
 
-For design or PR review, Architecture Delta compares validated Before / Delta / After snapshots with a machine receipt. Select an authored change or play one finite, viewer-only Review; it infers no impact, risk, or merge safety.
+Architecture Delta compares validated Before / Delta / After snapshots with a machine receipt. Provenance stays separate from graph changes. Select an authored change or play a finite, viewer-only Review; neither infers impact, risk, or merge safety.
 
 `node archify/bin/archify.mjs compare architecture base.json head.json architecture-delta.html --json`
 
@@ -201,7 +201,7 @@ Archify is not a general-purpose drawing editor or a Mermaid theme. It turns tec
 | **Generate** | The agent creates typed JSON IR from your description. |
 | **Validate** | Bundled validators and layout rules check the source; failures identify the exact local repair in machine-readable JSON. |
 | **Preview (optional)** | A loopback-only desktop session watches one source and reloads only verified revisions; failures keep the last-good artifact. |
-| **Deliver** | A same-directory candidate is rendered and checked; only after the artifact/provenance pair commits, its journal finalizes, and its delivery lock is released may optional `--open` launch that exact file. |
+| **Deliver** | A checked artifact/provenance pair becomes current only after its journal finalizes and lock releases; optional `--open` runs afterward. |
 | **Iterate** | The agent updates the source while unrelated structure stays stable. |
 
 Useful repository commands:
@@ -218,7 +218,7 @@ node bin/archify.mjs deliver workflow examples/agent-tool-call.workflow.json /tm
 
 `preview` is an explicit loopback-only desktop mode: it watches one JSON file on a random `127.0.0.1` port, keeps the last verified output through failures, stops with Ctrl-C, and adds no generated-HTML runtime. Use `--no-open` for tests or manual URL opening.
 
-`deliver --open` is an opt-in one-shot handoff after delivery commit, journal finalization, and lock release. Opener failure preserves success; JSON remains on stdout and the absolute fallback path goes to stderr.
+`deliver --open` runs only after commit, journal finalization, and lock release. Opener failure preserves success; JSON stays on stdout and the absolute fallback path goes to stderr.
 
 On failure, `validate --json` and `deliver --json` emit one JSON object. Apply only each `diagnostics[]` subject's `supportedFixes`, within the Skill's two correction rounds; visual review remains separate.
 
@@ -253,7 +253,7 @@ Settings:
 
 Stable links can restore `#focus=<id>`, `#focus=<id>&reach=upstream|downstream`, `#relation=<id>`, `#route=<source>~<target>`, `#lens=<kind>~<kind>`, and `#view=<view-id>`. Reader-driven motion is finite, respects `prefers-reduced-motion`, and never enters canonical exports.
 
-The complete generation and viewer contract lives in [`archify/SKILL.md`](archify/SKILL.md).
+Generation and Viewer contracts: [`archify/SKILL.md`](archify/SKILL.md).
 
 ## Installation options
 
@@ -273,6 +273,7 @@ The complete generation and viewer contract lives in [`archify/SKILL.md`](archif
 - [Schema reference](archify/schemas/README.md) · [Skill](archify/SKILL.md) · [Examples](archify/examples/) · [Agent cookbook](docs/authoring-cookbook.md)
 - [Changelog](CHANGELOG.md)
 - [Roadmap](ROADMAP.md)
+- [Layered reading](archify/references/layered-reading.md)
 - [Generated Proof Lab](https://tt-a1i.github.io/archify/gallery.html)
 
 Automatic Mermaid parsing, general-purpose auto-layout, hosted sharing, and WYSIWYG editing are intentionally outside the current scope.

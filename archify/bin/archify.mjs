@@ -61,7 +61,11 @@ function deliveryOwnershipState(ownership, operation) {
 }
 
 function sameFileIdentity(actual, expected) {
-  return actual.dev === expected.dev && actual.ino === expected.ino;
+  const hasIdentity = (entry) => entry.ino !== 0 && entry.ino !== 0n;
+  return hasIdentity(actual)
+    && hasIdentity(expected)
+    && actual.dev === expected.dev
+    && actual.ino === expected.ino;
 }
 
 function assertDeliveryOwnership(ownership, operation, { allowInitializing = false, pending = 'ignore' } = {}) {
@@ -173,6 +177,21 @@ function releaseDeliveryOwnership(ownership, { allowInitializing = false } = {})
 
 function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias, recordInitializationFailure) {
   const lockPath = deliveryLockPath(output);
+  try {
+    const existingLock = fs.lstatSync(lockPath);
+    if (!existingLock.isFile()) {
+      throw Object.assign(new Error(`Unrecognized delivery lock at "${lockPath}"; inspect the existing entry before retrying.`), {
+        deliveryLockCode: 'delivery/lock-invalid',
+      });
+    }
+  } catch (error) {
+    if (error.deliveryLockCode) throw error;
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') {
+      throw Object.assign(new Error(`Unrecognized delivery lock at "${lockPath}"; inspect the existing entry before retrying.`), {
+        deliveryLockCode: 'delivery/lock-invalid',
+      });
+    }
+  }
   if (pathsAlias(lockPath, inputPath)) {
     throw Object.assign(new Error('Delivery lock path aliases the input specification; choose another output path.'), {
       deliveryLockCode: 'delivery/lock-path-conflict',
@@ -217,6 +236,7 @@ function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias, recordIni
             initializationError: error.message,
             ...(error?.code ? { initializationSystemCode: error.code } : {}),
           };
+          if (error.deliveryFailureRecord) cleanupError.deliveryFailureRecord = error.deliveryFailureRecord;
           throw cleanupError;
         }
         error.lockCleanupError = cleanupError.message;
@@ -304,7 +324,6 @@ function beginDeliveryAttempt({ ownership, input, pathsAlias }) {
   }
   assertDeliveryOwnership(ownership, 'finish creating the delivery journal', { allowInitializing: true });
   state.pendingIdentity = pendingIdentity;
-  if (state.phase !== 'initializing') state.phase = 'journaled';
 }
 
 function writeDeliveryProvenance(file, value, { beforeReplace } = {}) {
@@ -634,12 +653,13 @@ function invalidProvenance(artifactPath, sidecar, reason) {
 
 function usage() {
   return `Usage:
-  archify render <type> <input.json> [output.html] [--quality standard|showcase] [--repo-root path (architecture only)]
+  archify render <type> <input.json> [output.html] [--quality standard|showcase] [--repo-root path]
   archify compare architecture <base.json> <head.json> [output.html] [--receipt path] [--json] [--quality standard|showcase] [--repo-root path]
-  archify deliver <type> <input.json> [output.html] [--json] [--open] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify preview <type> <input.json> [output.html] [--no-open] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify validate <type> <input.json> [--json] [--layout-json] [--quality standard|showcase] [--repo-root path (architecture only)]
-  archify migrate workflow <old.json> <new.json> --to-schema 2 [--json]
+  archify deliver <type> <input.json> [output.html] [--json] [--open] [--quality standard|showcase] [--repo-root path]
+  archify preview <type> <input.json> [output.html] [--no-open] [--quality standard|showcase] [--repo-root path]
+  archify validate <type> <input.json> [--json] [--layout-json] [--quality standard|showcase] [--repo-root path]
+  archify migrate workflow <old.json> <new.json> --to-schema 2 [--json] [--repo-root path]
+  archify atlas <manifest.json> <output.html> [--json]
   archify inspect <type> <input.json>
   archify check <output.html> [--require-provenance]
   archify visual-check <output.html> [--json] [--require-provenance] [--out-dir <dir>]
@@ -906,6 +926,7 @@ const COMPOSITION_FIXES = {
   'composition/ambiguous-corridor': ['adjust route/via or channel coordinates so unrelated relationships do not visually merge'],
   'composition/container-border-run': ['route across the frame perpendicularly through a clear opening'],
   'composition/label-route-clearance': ['adjust labelAt, labelDx, labelDy, labelSegment, message y, or the other relationship route'],
+  'composition/label-canvas-containment': ['adjust labelAt, labelDx, labelDy, or labelSegment so the label rect stays inside the viewBox, or enlarge meta.viewBox'],
   'composition/desktop-readability': ['reduce the viewBox width, shorten node copy, widen affected nodes, or split the diagram so node context remains at least 6px at a 1440px desktop viewport'],
   'composition/micro-segment': ['move the route/channel/via point so every visible segment is at least 8px'],
   'composition/short-interior-segment': ['move the route/channel/via point so every interior turn has at least 16px'],
@@ -952,16 +973,6 @@ function formatDiagnostics(error, diagnostics = []) {
       return `[${entry.code}] ${entry.message}${fix}`;
     }),
   ].join('\n');
-}
-
-function assertEvidenceType(type, repoRoot) {
-  if (repoRoot && type !== 'architecture') {
-    rejectCliArgument('--repo-root is currently supported for architecture diagrams only.', {
-      code: 'cli/unsupported-option',
-      subject: { option: '--repo-root', type },
-      supportedFixes: ['remove --repo-root or use an architecture diagram'],
-    });
-  }
 }
 
 function exitFrom(result) {
@@ -1195,7 +1206,14 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
       assertDeliveryOwnership(ownership, 'finish the delivery rollback', { pending: 'identity' });
     } catch (rollbackError) {
       if (rollbackError.deliveryOwnershipCode === 'delivery/ownership-lost') {
-        rollbackError.deliveryCommitDetails = { ...(rollbackError.deliveryCommitDetails || {}), ...recoveryDetails() };
+        rollbackError.deliveryCommitDetails = {
+          ...(rollbackError.deliveryCommitDetails || {}),
+          commitError: {
+            reason: cause.message,
+            ...(cause?.code ? { systemCode: cause.code } : {}),
+          },
+          ...recoveryDetails(),
+        };
         throw rollbackError;
       }
       rollbackErrors.push(rollbackError.message);
@@ -1573,7 +1591,6 @@ function commandRender(args) {
   if (unknown.length) fail(`Unknown render option "${unknown[0]}".`);
   const [type, input, output] = repoArgs.rest;
   if (!type || !input || repoArgs.rest.length > 3) fail(usage());
-  assertEvidenceType(type, repoArgs.repoRoot);
   const result = runNode([rendererPath(type), input, ...(output ? [output] : [])], {
     env: rendererEnv(qualityArgs.quality, repoArgs.repoRoot),
   });
@@ -1606,21 +1623,22 @@ function writeDeliveryFailureReceipt(options) {
   const ownershipOrLockError = recorded.ownershipError || recorded.lockError;
   if (ownershipOrLockError) {
     const failureWasRecorded = recorded.status && recorded.status !== 'unrecorded';
-    const lockBlocksFailureRecording = Boolean(
+    const lockOrOwnershipFailure = Boolean(
       ownershipOrLockError.deliveryLockCode
-      || ownershipOrLockError.deliveryOwnershipCode === 'delivery/ownership-lost',
+      || ownershipOrLockError.deliveryOwnershipCode,
     );
     reportArtifactFailure({
       ...options,
       command: 'deliver',
       receiptId,
-      error: lockBlocksFailureRecording
+      status: 1,
+      error: lockOrOwnershipFailure
         ? `Could not safely continue delivery for "${options.output}": ${ownershipOrLockError.message}`
         : options.error,
       ...(failureWasRecorded ? { provenance: recorded.status } : {}),
       diagnostics: [
-        ...(!lockBlocksFailureRecording ? (options.diagnostics || []) : []),
         deliveryLockFailureDiagnostic(options.output, ownershipOrLockError),
+        ...(options.diagnostics || []),
         ...(recorded.diagnostic ? [recorded.diagnostic] : []),
       ],
     });
@@ -1696,7 +1714,6 @@ async function commandDeliver(args) {
     code: 'cli/usage',
     supportedFixes: ['use: archify deliver <type> <input.json> [output.html] [options]'],
   });
-  assertEvidenceType(type, repoArgs.repoRoot);
   const renderer = rendererPath(type);
   const { pathsAlias, resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
   const receiptId = randomUUID();
@@ -2248,7 +2265,6 @@ async function commandPreview(args) {
   const positional = repoArgs.rest.filter((arg) => !knownOptions.has(arg));
   const [type, input, output] = positional;
   if (!type || !input || positional.length > 3) fail(usage());
-  assertEvidenceType(type, repoArgs.repoRoot);
   rendererPath(type);
 
   let runPreview;
@@ -2854,7 +2870,8 @@ function extractMigrationOptions(args) {
 }
 
 async function commandMigrate(args) {
-  const options = extractMigrationOptions(args);
+  const repoArgs = extractRepoRootArgs(args);
+  const options = extractMigrationOptions(repoArgs.rest);
   const [type, sourceArgument, destinationArgument] = options.positional;
   if (
     type !== 'workflow'
@@ -2863,7 +2880,7 @@ async function commandMigrate(args) {
     || options.positional.length !== 3
     || options.toSchema !== '2'
   ) {
-    fail('Usage: archify migrate workflow <old.json> <new.json> --to-schema 2 [--json]');
+    fail('Usage: archify migrate workflow <old.json> <new.json> --to-schema 2 [--json] [--repo-root path]');
   }
 
   const sourcePath = path.resolve(sourceArgument);
@@ -2979,7 +2996,7 @@ async function commandMigrate(args) {
     fs.writeFileSync(candidatePath, destinationBytes, { flag: 'wx' });
     const render = runNode([rendererPath('workflow'), candidatePath, artifactPath], {
       stdio: 'pipe',
-      env: rendererEnv(activeQualityProfile, undefined, true),
+      env: rendererEnv(activeQualityProfile, repoArgs.repoRoot, true),
     });
     if (render.status !== 0) {
       const failure = rendererFailure(render);
@@ -3097,7 +3114,6 @@ function commandValidate(args) {
     code: 'cli/usage',
     supportedFixes: ['use: archify validate <type> <input.json> [options]'],
   });
-  assertEvidenceType(type, repoRoot);
   const renderer = rendererPath(type);
 
   if (layoutJson && !['architecture', 'workflow'].includes(type)) {
@@ -3250,6 +3266,9 @@ try {
       break;
     case 'check':
       commandCheck(args);
+      break;
+    case 'atlas':
+      (await import('./atlas.mjs')).commandAtlas(args);
       break;
     case 'visual-check':
       await commandVisualCheck(args);
