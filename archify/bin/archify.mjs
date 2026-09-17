@@ -2252,7 +2252,26 @@ async function commandDeliver(args) {
       if (receipt.open?.status === 'opened') console.log(`opened ${outputPath}`);
     }
   } finally {
-    if (deliveryOwnership) releaseDeliveryOwnership(deliveryOwnership, { allowInitializing: true });
+    if (deliveryOwnership) {
+      try {
+        releaseDeliveryOwnership(deliveryOwnership, { allowInitializing: true });
+      } catch (error) {
+        if (error.deliveryOwnershipCode === 'delivery/ownership-lost') {
+          recoveryRequired = true;
+          error.deliveryCommitDetails = {
+            ...(error.deliveryCommitDetails || {}),
+            recoveryRequired: true,
+            recoveryDirectory: stagingDirectory,
+            recoverableBackups: commitRecoveryBackups,
+          };
+        }
+        console.error(formatDiagnostics(
+          `Delivery cleanup could not release its lock for "${outputPath}".`,
+          [deliveryLockFailureDiagnostic(outputPath, error)],
+        ));
+        process.exitCode = 1;
+      }
+    }
     if (recoveryRequired) {
       console.error(`Recovery required: delivery backups were retained at "${stagingDirectory}".`);
     } else {

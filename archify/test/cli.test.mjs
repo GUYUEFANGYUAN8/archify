@@ -1917,6 +1917,107 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(sha256(out), previousHash);
 });
 
+test('cli: portable delivery lock: final cleanup preserves an unexpected primary failure when release also fails', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-unexpected-release-failure.html');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const wrapper = path.join(tmp, 'delivery-unexpected-release-failure.mjs');
+  const stagingBefore = fs.readdirSync(path.dirname(out))
+    .filter((entry) => entry.startsWith('.archify-delivery-'))
+    .sort();
+  fs.writeFileSync(wrapper, `
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const spawnSync = childProcess.spawnSync;
+childProcess.spawnSync = (executable, args, options) => {
+  if (String(args?.[0]).includes('render-workflow.mjs')) {
+    throw new Error('injected unexpected renderer dispatch failure');
+  }
+  return spawnSync(executable, args, options);
+};
+syncBuiltinESMExports();
+const unlinkSync = fs.unlinkSync;
+fs.unlinkSync = (file, ...args) => {
+  if (String(file) === ${JSON.stringify(lockPath)}) {
+    throw Object.assign(new Error('injected final lock release failure'), { code: 'EACCES' });
+  }
+  return unlinkSync(file, ...args);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.match(failed.stderr, /injected unexpected renderer dispatch failure/);
+  assert.match(failed.stderr, /\[delivery\/lock-release\]/);
+  assert.match(failed.stderr, /injected final lock release failure/);
+  assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(fs.existsSync(pendingPath), true);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(out))
+      .filter((entry) => entry.startsWith('.archify-delivery-'))
+      .sort(),
+    stagingBefore,
+  );
+});
+
+test('cli: portable delivery lock: final cleanup preserves successor state after unexpected ownership loss', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-unexpected-ownership-loss.html');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const successor = successorDeliveryState({
+    receiptId: '16161616-1616-4616-8616-161616161616',
+    input,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'delivery-unexpected-ownership-loss.mjs');
+  const stagingBefore = new Set(fs.readdirSync(path.dirname(out))
+    .filter((entry) => entry.startsWith('.archify-delivery-')));
+  fs.writeFileSync(wrapper, `
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const spawnSync = childProcess.spawnSync;
+childProcess.spawnSync = (executable, args, options) => {
+  if (String(args?.[0]).includes('render-workflow.mjs')) {
+    for (const [target, contents] of ${JSON.stringify([
+      [lockPath, successor.lock],
+      [pendingPath, successor.pending],
+      [provenancePath, successor.provenance],
+    ])}) {
+      if (fs.existsSync(target)) fs.renameSync(target, \`${'${target}'}.owner-a\`);
+      fs.writeFileSync(target, contents, { flag: 'wx' });
+    }
+    throw new Error('injected unexpected failure after successor takeover');
+  }
+  return spawnSync(executable, args, options);
+};
+syncBuiltinESMExports();
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.match(failed.stderr, /injected unexpected failure after successor takeover/);
+  assert.match(failed.stderr, /\[delivery\/ownership-lost\]/);
+  assert.match(failed.stderr, /Recovery required:/);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  const recoveryDirectories = fs.readdirSync(path.dirname(out))
+    .filter((entry) => entry.startsWith('.archify-delivery-') && !stagingBefore.has(entry));
+  assert.equal(recoveryDirectories.length, 1);
+  assert.equal(fs.existsSync(path.join(path.dirname(out), recoveryDirectories[0], 'specification.snapshot.json')), true);
+});
+
 test('cli: lock release failure does not invoke the requested opener', (t) => {
   if (process.platform === 'win32') {
     t.skip('fake open and xdg-open executables cover POSIX opener dispatch');
