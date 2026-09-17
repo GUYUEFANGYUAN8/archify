@@ -19,14 +19,47 @@ Each output has three independent delivery metadata paths:
 - `<output-stem>.delivery-lock.json` serializes attempts targeting the same
   output.
 
-`deliver` creates the journal before rendering and keeps it through the
-recoverable HTML/sidecar pair commit. It removes the journal only after that
-commit completes. A validation or render failure, a locked destination, or a
-process interruption may therefore leave a journal. The journal is a safety
-barrier: `check` and `visual-check` fail closed when any directory entry exists
-at the journal or lock path, including an unreadable file, symlink, or dangling
-symlink. Run deliveries targeting the same output path serially; one attempt
-must finish or be recovered before another begins.
+`deliver` acquires the lock by exclusive `open(..., "wx")` before creating or
+replacing the recovery journal. A successful exclusive create yields an
+internal opaque ownership capability bound to that attempt. Journal creation,
+failed-provenance recording, pair commit, rollback, journal finalization, and
+lock release each verify the current capability inside the operation that
+would mutate shared state. A rejected contender does not create a journal or
+write failed provenance.
+
+An existing lock is handled without automatic recovery:
+
+| Observed lock state | Required `deliver` result |
+| --- | --- |
+| No directory entry | Attempt exclusive creation; only its success grants ownership. |
+| Valid schema-v1 lock whose PID is running, or whose death cannot be established | Exit 1 with `delivery/concurrent-attempt`; preserve every shared path. |
+| Valid schema-v1 lock whose PID is known to have exited | Exit 1 with `delivery/lock-stale`; preserve the lock, artifact, journal, and current provenance exactly. |
+| Unreadable, malformed, symlink, dangling symlink, directory, or other non-regular lock entry | Exit 1 with `delivery/lock-invalid`; preserve the entry and every other shared path. |
+| An acquired capability no longer matches the current lock or journal | Exit 1 with `delivery/ownership-lost`; stop all shared-path mutation. |
+| The matching owner cannot remove its lock | Exit 1 with `delivery/lock-release`; preserve the lock. |
+
+A `delivery/lock-stale` diagnostic identifies the absolute output and lock
+paths plus the original PID and receipt ID. Recovery is deliberately explicit
+and serial: stop all delivery attempts for that output, confirm that no active
+delivery owns it and that the reported stale entry has not been replaced,
+remove only the reported lock, then rerun `deliver`. Do not remove the artifact,
+current provenance, or pending journal as part of stale-lock recovery.
+
+The lock protocol targets Node.js 18 or later on a local filesystem with
+cooperating Archify processes. PID, receipt, and file-identity comparisons are
+defensive checks, not an atomic compare-and-swap. This contract does not claim
+distributed-lock correctness on NFS, SMB, or other network filesystems, and it
+cannot prevent an external process that ignores the protocol from replacing
+shared paths.
+
+After ownership is established, `deliver` creates the journal before rendering
+and keeps it through the recoverable HTML/sidecar pair commit. It removes the
+journal only after that commit completes. A validation, render, or pair-commit
+failure, or a process interruption, may therefore leave a journal. The journal
+is a safety barrier: `check` and `visual-check` fail closed when any directory
+entry exists at the journal or lock path, including an unreadable file,
+symlink, or dangling symlink. Run deliveries targeting the same output path
+serially; one attempt must finish or be recovered before another begins.
 
 A successful sidecar has `schemaVersion: 1`, `status: "current"`,
 `command: "deliver"`, a unique `receiptId`, the diagram `type`, an absolute
@@ -37,15 +70,19 @@ reject a sidecar symlink, including a dangling one. A checker binds provenance
 to the artifact bytes it actually checks and verifies that binding again before
 reporting success; a concurrent byte change fails.
 
-If an attempt fails after an older HTML exists, Archify writes a new
-`status: "failed"` sidecar and leaves the journal until recovery is complete.
-An unreadable old HTML does not prevent that marker; its artifact hash and byte
-count may be absent. If the sidecar is locked or otherwise unwritable, Archify
-keeps the prior sidecar rather than deleting evidence, and the journal prevents
-checkers from trusting it. If every metadata path is unavailable, the failure
-receipt reports `provenance: "unrecorded"`; no tool can preserve that fact
-across processes. Restore metadata-path access and complete a successful
-`deliver` before trusting the output.
+If a currently verified owner fails after an older HTML exists, Archify writes
+a new `status: "failed"` sidecar and leaves the journal until recovery is
+complete. An unreadable old HTML does not prevent that marker; its artifact hash
+and byte count may be absent. If the sidecar is locked or otherwise unwritable,
+Archify keeps the prior sidecar rather than deleting evidence, and the journal
+prevents checkers from trusting it. A rejected concurrent, stale, or invalid
+lock attempt does not write failed provenance. If ownership is lost, Archify
+reports `delivery/ownership-lost`, does not overwrite or remove the successor's
+artifact, provenance, journal, or lock, and does not claim recorded failed
+provenance; a failure receipt may report `provenance: "unrecorded"`. If every
+metadata path is unavailable, the same unrecorded status applies; no tool can
+preserve that fact across processes. Restore metadata-path access and complete
+a successful `deliver` before trusting the output.
 
 Artifacts with no sidecar, journal, or lock remain supported for backward
 compatibility and for the lower-level `render` command. Their checker receipts
@@ -77,21 +114,33 @@ Deliver reads the specification once, writes those exact bytes to a private same
 The pair commit is recoverable, not a claim that two filesystem paths change
 atomically or are durable across power loss. Journal finalization is part of
 that commit: a caught failure while verifying or removing the journal rolls
-back the replaced files when possible. If restoration fails, the failure receipt
-identifies retained backups for recovery. A process interruption can leave the journal, backups, or
-private staging behind; checkers then fail closed. Rerun `deliver` serially on
-the same output to recover and establish a new current receipt, following any
-diagnostic that identifies abandoned private staging requiring cleanup. A
-failed attempt exits non-zero, never invokes an opener, and never authorizes
-visual evidence collection.
+back the replaced files when possible and while ownership remains current. If
+ownership is lost, the old attempt immediately stops renaming, rolling back,
+finalizing the journal, recording failure provenance, or cleaning up shared
+paths. Any private staging or recoverable backups remain available and are
+identified by the failure diagnostic. If restoration fails for another reason,
+the failure receipt likewise identifies retained backups for recovery. A
+process interruption can leave the journal, backups, or private staging behind;
+checkers then fail closed. Follow the reported recovery evidence before rerunning
+`deliver` serially on the same output. A failed attempt exits non-zero and never invokes an opener; it never
+authorizes visual evidence collection.
 
-Failure to initialize a delivery lock records failed provenance while the
-attempt still owns the lock, then cleans up that lock when possible. Filesystem
-and cleanup errors are reported separately from an active concurrent delivery.
-An active, unrecognized, or otherwise preserved lock independently prevents
-checkers from accepting the prior artifact. Fix the reported filesystem error
-before retrying, and use another output path if the lock path contains unrelated
-data.
+If exclusive creation succeeds but lock initialization fails, Archify may
+record failed provenance and remove the incomplete lock only while its
+capability still identifies that exact entry. A replacement is preserved.
+Filesystem and cleanup errors are reported separately from an active concurrent
+delivery. An active, stale, unrecognized, or otherwise preserved lock
+independently prevents checkers from accepting the prior artifact. Fix the
+reported filesystem error before retrying, and use another output path if the
+lock path contains unrelated data.
+
+Lock release is part of delivery completion. If the artifact/provenance pair
+has committed and the journal has finalized but the matching lock cannot be
+removed, `deliver` exits 1 with `delivery/lock-release`, preserves the lock,
+does not print a success receipt, and does not invoke an opener. The preserved
+lock keeps strict checkers fail-closed. Only after pair commit, journal
+finalization, and lock release all succeed may `deliver` exit zero, print its
+success receipt, or run `--open`.
 
 Run strict `check` after `deliver` exits zero. Run `visual-check` only after that
 strict check exits zero. A failed marker, recovery journal, or delivery lock
@@ -172,9 +221,9 @@ cleanup; do not present remaining sidecars as current evidence.
 ## Optional opening
 
 Add `--open` only when the user wants an immediate local preview. It runs after
-the verified pair commit has completed and its recovery journal has been
-removed, uses one argument-array OS opener with a five-second bound, and records
-`open.status`. Keep it off for CI, unattended agents, and non-interactive
+the verified pair commit has completed, its recovery journal has been removed,
+and the delivery lock has been released successfully. It uses one argument-array
+OS opener with a five-second bound and records `open.status`. Keep it off for CI, unattended agents, and non-interactive
 environments. Failure or unsupported opening does not invalidate delivery; its
 status proves only whether the local opener invocation succeeded.
 

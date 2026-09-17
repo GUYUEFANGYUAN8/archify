@@ -35,6 +35,142 @@ function processIsRunning(pid) {
   }
 }
 
+const deliveryOwnershipStates = new WeakMap();
+
+function deliveryOwnershipFailure(state, operation, reason, evidence = {}) {
+  const error = new Error(`Delivery ownership was lost while attempting to ${operation}: ${reason}`);
+  error.deliveryOwnershipCode = 'delivery/ownership-lost';
+  error.deliveryOwnershipDetails = {
+    operation,
+    lock: state?.lockPath,
+    expectedReceiptId: state?.receiptId,
+    reason,
+    ...evidence,
+  };
+  if (state && state.phase !== 'released') state.phase = 'lost';
+  return error;
+}
+
+function deliveryOwnershipState(ownership, operation) {
+  const state = deliveryOwnershipStates.get(ownership);
+  if (!state) throw deliveryOwnershipFailure(undefined, operation, 'the ownership capability is invalid');
+  if (state.phase === 'lost' || state.phase === 'released') {
+    throw deliveryOwnershipFailure(state, operation, `the capability is already ${state.phase}`);
+  }
+  return state;
+}
+
+function sameFileIdentity(actual, expected) {
+  return actual.dev === expected.dev && actual.ino === expected.ino;
+}
+
+function assertDeliveryOwnership(ownership, operation, { allowInitializing = false, pending = 'ignore' } = {}) {
+  const state = deliveryOwnershipState(ownership, operation);
+  let lockEntry;
+  try {
+    lockEntry = fs.lstatSync(state.lockPath);
+  } catch (error) {
+    throw deliveryOwnershipFailure(state, operation, 'the owned lock entry can no longer be inspected', {
+      ...(error?.code ? { systemCode: error.code } : {}),
+    });
+  }
+  if (!lockEntry.isFile() || !sameFileIdentity(lockEntry, state.lockIdentity)) {
+    throw deliveryOwnershipFailure(state, operation, 'the lock path no longer names the entry created by this attempt');
+  }
+  if (state.phase !== 'initializing' || !allowInitializing) {
+    let lock;
+    try {
+      lock = JSON.parse(fs.readFileSync(state.lockPath, 'utf8'));
+    } catch (error) {
+      throw deliveryOwnershipFailure(state, operation, 'the owned lock receipt can no longer be verified', {
+        ...(error?.code ? { systemCode: error.code } : {}),
+      });
+    }
+    if (lock?.schemaVersion !== 1 || lock.receiptId !== state.receiptId || lock.pid !== state.pid) {
+      throw deliveryOwnershipFailure(state, operation, 'the lock receipt no longer matches this attempt', {
+        ...(typeof lock?.receiptId === 'string' ? { observedReceiptId: lock.receiptId } : {}),
+      });
+    }
+  }
+  if (pending !== 'ignore') {
+    const pendingPath = deliveryPendingPath(state.output);
+    let pendingEntry;
+    try {
+      pendingEntry = fs.lstatSync(pendingPath);
+    } catch (error) {
+      if (pending === 'absent' && error.code === 'ENOENT') return state;
+      throw deliveryOwnershipFailure(state, operation, 'the owned delivery journal can no longer be inspected', {
+        journal: pendingPath,
+        ...(error?.code ? { systemCode: error.code } : {}),
+      });
+    }
+    if (pending === 'absent') {
+      throw deliveryOwnershipFailure(state, operation, 'the finalized delivery journal was recreated', { journal: pendingPath });
+    }
+    if (!state.pendingIdentity || !pendingEntry.isFile() || !sameFileIdentity(pendingEntry, state.pendingIdentity)) {
+      throw deliveryOwnershipFailure(state, operation, 'the delivery journal no longer names the entry created by this attempt', {
+        journal: pendingPath,
+      });
+    }
+    if (pending === 'owned' || pending === 'identity') {
+      let journalSource;
+      try {
+        journalSource = fs.readFileSync(pendingPath, 'utf8');
+      } catch (error) {
+        // An unreadable journal is a commit/finalization failure. The unchanged
+        // lock and journal identities still permit a guarded rollback.
+        if (pending === 'owned') throw error;
+        return state;
+      }
+      let journal;
+      try {
+        journal = JSON.parse(journalSource);
+      } catch {
+        throw deliveryOwnershipFailure(state, operation, 'the delivery journal receipt is malformed', {
+          journal: pendingPath,
+        });
+      }
+      if (journal?.receiptId !== state.receiptId) {
+        throw deliveryOwnershipFailure(state, operation, 'the delivery journal receipt belongs to another attempt', {
+          journal: pendingPath,
+          ...(typeof journal?.receiptId === 'string' ? { observedReceiptId: journal.receiptId } : {}),
+        });
+      }
+    }
+  }
+  return state;
+}
+
+function releaseDeliveryOwnership(ownership, { allowInitializing = false } = {}) {
+  const current = deliveryOwnershipState(ownership, 'release the delivery lock');
+  const pending = current.phase === 'finalized'
+    ? 'absent'
+    : current.pendingIdentity
+      ? 'identity'
+      : 'ignore';
+  const state = assertDeliveryOwnership(ownership, 'release the delivery lock', { allowInitializing, pending });
+  try {
+    fs.unlinkSync(state.lockPath);
+  } catch (cause) {
+    if (cause.code === 'ENOENT') {
+      throw deliveryOwnershipFailure(state, 'release the delivery lock', 'the owned lock disappeared before it could be removed', {
+        systemCode: cause.code,
+      });
+    }
+    const error = new Error(`Could not release delivery lock "${state.lockPath}": ${cause.message}`);
+    error.code = cause.code;
+    error.deliveryOwnershipCode = 'delivery/lock-release';
+    error.deliveryOwnershipDetails = {
+      operation: 'release the delivery lock',
+      lock: state.lockPath,
+      expectedReceiptId: state.receiptId,
+      reason: cause.message,
+    };
+    throw error;
+  }
+  state.phase = 'released';
+}
+
 function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias, recordInitializationFailure) {
   const lockPath = deliveryLockPath(output);
   if (pathsAlias(lockPath, inputPath)) {
@@ -42,76 +178,76 @@ function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias, recordIni
       deliveryLockCode: 'delivery/lock-path-conflict',
     });
   }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    let descriptor;
-    let createdLock;
-    try {
-      descriptor = fs.openSync(lockPath, 'wx', 0o600);
-      createdLock = fs.fstatSync(descriptor);
-      fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, receiptId, pid: process.pid })}\n`);
-      fs.closeSync(descriptor);
-      descriptor = undefined;
-      return () => {
-        try {
-          const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-          if (lock.receiptId === receiptId) fs.unlinkSync(lockPath);
-        } catch (error) {
-          if (error.code !== 'ENOENT') {
-            console.error(`Warning: could not release delivery lock "${lockPath}": ${error.message}`);
-          }
-        }
-      };
-    } catch (error) {
-      if (descriptor !== undefined) {
-        try {
-          fs.closeSync(descriptor);
-        } catch (closeError) {
-          error.lockCleanupError = closeError.message;
-        }
-      }
-      if (createdLock) {
-        try {
-          const current = fs.lstatSync(lockPath);
-          // Record the failed attempt while this process still owns the path,
-          // then remove only that exact entry. A replacement may belong to a
-          // different attempt or contain unrelated user data.
-          if (current.dev === createdLock.dev && current.ino === createdLock.ino) {
-            error.deliveryFailureRecord = recordInitializationFailure?.(error);
-            fs.unlinkSync(lockPath);
-          }
-        } catch (cleanupError) {
-          if (cleanupError.code !== 'ENOENT') error.lockCleanupError = cleanupError.message;
-        }
-        throw error;
-      }
-      if (error.code !== 'EEXIST') throw error;
-      let lock;
+  let descriptor;
+  let ownership;
+  try {
+    descriptor = fs.openSync(lockPath, 'wx', 0o600);
+    const lockIdentity = fs.fstatSync(descriptor);
+    ownership = Object.freeze({});
+    deliveryOwnershipStates.set(ownership, {
+      output: path.resolve(output),
+      lockPath,
+      receiptId,
+      pid: process.pid,
+      lockIdentity,
+      phase: 'initializing',
+    });
+    fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, receiptId, pid: process.pid })}\n`);
+    deliveryOwnershipStates.get(ownership).phase = 'owned';
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    return ownership;
+  } catch (error) {
+    if (descriptor !== undefined) {
       try {
-        if (!fs.lstatSync(lockPath).isFile()) throw new Error('Not a regular lock file.');
-        lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-        if (lock?.schemaVersion !== 1 || !Number.isSafeInteger(lock.pid) || lock.pid <= 0
-          || typeof lock.receiptId !== 'string'
-          || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(lock.receiptId)) {
-          throw new Error('Unrecognized delivery lock.');
-        }
-      } catch {
-        throw Object.assign(new Error(`Unrecognized delivery lock at "${lockPath}"; inspect the existing entry before retrying.`), {
-          deliveryLockCode: 'delivery/lock-invalid',
-        });
-      }
-      if (processIsRunning(lock.pid)) {
-        throw Object.assign(new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`), {
-          deliveryLockCode: 'delivery/concurrent-attempt',
-        });
-      }
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (removeError) {
-        throw new Error(`Could not recover stale delivery lock "${lockPath}": ${removeError.message}`);
+        fs.closeSync(descriptor);
+      } catch (closeError) {
+        error.lockCleanupError = closeError.message;
       }
     }
+    if (ownership) {
+      try {
+        assertDeliveryOwnership(ownership, 'record a lock initialization failure', { allowInitializing: true });
+        error.deliveryFailureRecord = recordInitializationFailure?.(error, ownership);
+        releaseDeliveryOwnership(ownership, { allowInitializing: true });
+      } catch (cleanupError) {
+        if (cleanupError.deliveryOwnershipCode) {
+          cleanupError.deliveryOwnershipDetails = {
+            ...(cleanupError.deliveryOwnershipDetails || {}),
+            initializationError: error.message,
+            ...(error?.code ? { initializationSystemCode: error.code } : {}),
+          };
+          throw cleanupError;
+        }
+        error.lockCleanupError = cleanupError.message;
+      }
+      throw error;
+    }
+    if (error.code !== 'EEXIST') throw error;
+    let lock;
+    try {
+      if (!fs.lstatSync(lockPath).isFile()) throw new Error('Not a regular lock file.');
+      lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      if (lock?.schemaVersion !== 1 || !Number.isSafeInteger(lock.pid) || lock.pid <= 0
+        || typeof lock.receiptId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(lock.receiptId)) {
+        throw new Error('Unrecognized delivery lock.');
+      }
+    } catch {
+      throw Object.assign(new Error(`Unrecognized delivery lock at "${lockPath}"; inspect the existing entry before retrying.`), {
+        deliveryLockCode: 'delivery/lock-invalid',
+      });
+    }
+    if (processIsRunning(lock.pid)) {
+      throw Object.assign(new Error(`Another delivery attempt owns "${output}" through lock "${lockPath}".`), {
+        deliveryLockCode: 'delivery/concurrent-attempt',
+      });
+    }
+    throw Object.assign(new Error(`A stale delivery lock remains at "${lockPath}"; recover it serially before retrying.`), {
+      deliveryLockCode: 'delivery/lock-stale',
+      deliveryLockOwner: { pid: lock.pid, receiptId: lock.receiptId },
+    });
   }
-  throw new Error(`Could not acquire delivery lock for "${output}".`);
 }
 
 function pathEntryExists(file) {
@@ -128,7 +264,9 @@ function artifactIdentity(artifact) {
   return { sha256: createHash('sha256').update(artifact).digest('hex'), bytes: artifact.byteLength };
 }
 
-function beginDeliveryAttempt({ output, input, receiptId, pathsAlias }) {
+function beginDeliveryAttempt({ ownership, input, pathsAlias }) {
+  const state = assertDeliveryOwnership(ownership, 'begin the delivery journal', { allowInitializing: true });
+  const { output, receiptId } = state;
   const journal = deliveryPendingPath(output);
   for (const protectedPath of [input, output, deliveryProvenancePath(output)].filter(Boolean)) {
     if (pathsAlias(journal, protectedPath)) throw new Error('Delivery journal aliases an input or output.');
@@ -136,14 +274,45 @@ function beginDeliveryAttempt({ output, input, receiptId, pathsAlias }) {
   writeDeliveryProvenance(journal, {
     schemaVersion: 1, command: 'deliver', status: 'pending', receiptId,
     input, output: path.resolve(output),
+  }, {
+    beforeReplace: () => assertDeliveryOwnership(ownership, 'create the delivery journal', { allowInitializing: true }),
   });
+  assertDeliveryOwnership(ownership, 'finish creating the delivery journal', { allowInitializing: true });
+  let pendingIdentity;
+  try {
+    pendingIdentity = fs.lstatSync(journal);
+  } catch (error) {
+    throw deliveryOwnershipFailure(state, 'finish creating the delivery journal', 'the new journal identity cannot be captured', {
+      journal,
+      ...(error?.code ? { systemCode: error.code } : {}),
+    });
+  }
+  let pending;
+  try {
+    pending = JSON.parse(fs.readFileSync(journal, 'utf8'));
+  } catch (error) {
+    throw deliveryOwnershipFailure(state, 'finish creating the delivery journal', 'the new journal cannot be verified', {
+      journal,
+      ...(error?.code ? { systemCode: error.code } : {}),
+    });
+  }
+  if (!pendingIdentity.isFile() || pending.receiptId !== receiptId) {
+    throw deliveryOwnershipFailure(state, 'finish creating the delivery journal', 'the new journal belongs to another attempt', {
+      journal,
+      ...(typeof pending?.receiptId === 'string' ? { observedReceiptId: pending.receiptId } : {}),
+    });
+  }
+  assertDeliveryOwnership(ownership, 'finish creating the delivery journal', { allowInitializing: true });
+  state.pendingIdentity = pendingIdentity;
+  if (state.phase !== 'initializing') state.phase = 'journaled';
 }
 
-function writeDeliveryProvenance(file, value) {
+function writeDeliveryProvenance(file, value, { beforeReplace } = {}) {
   const stagingDirectory = fs.mkdtempSync(path.join(path.dirname(file), '.archify-provenance-'));
   const temporary = path.join(stagingDirectory, path.basename(file));
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx' });
+    beforeReplace?.();
     fs.renameSync(temporary, file);
   } finally {
     fs.rmSync(stagingDirectory, { recursive: true, force: true });
@@ -152,119 +321,162 @@ function writeDeliveryProvenance(file, value) {
 
 function recordDeliveryFailure(options) {
   const {
-    output, stage, input, error, receiptId, pathsAlias, attemptStarted, lockOwned = false,
+    output, stage, input, error, receiptId, pathsAlias, ownership: suppliedOwnership,
+    releaseOwnership: shouldReleaseSuppliedOwnership = false,
   } = options;
   if (!output || !/\.html?$/i.test(output)) return { ok: true, status: 'not-applicable' };
-  if (!attemptStarted && !lockOwned) {
-    let releaseLock;
+  let ownership = suppliedOwnership;
+  let acquiredHere = false;
+  if (!ownership) {
     try {
-      releaseLock = acquireDeliveryLock(
+      ownership = acquireDeliveryLock(
         output,
         receiptId,
         input,
         pathsAlias,
-        (lockError) => recordDeliveryFailure({
+        (lockError, initializingOwnership) => recordDeliveryFailure({
           ...options,
           error: `Could not start delivery for "${output}": ${lockError.message}`,
-          lockOwned: true,
+          ownership: initializingOwnership,
+          releaseOwnership: false,
         }),
       );
+      acquiredHere = true;
     } catch (lockError) {
       return {
         ...(lockError.deliveryFailureRecord || { ok: false, status: 'unrecorded' }),
         lockError,
       };
     }
-    try {
-      return recordDeliveryFailure({ ...options, lockOwned: true });
-    } finally {
-      releaseLock();
-    }
   }
+  const state = deliveryOwnershipStates.get(ownership);
+  let recorded;
   // Keep independent evidence even when the artifact is unreadable or the
   // provenance target is locked, aliases the input, or cannot be replaced.
   let journalError;
-  if (!attemptStarted) {
+  if (!state?.pendingIdentity) {
     try {
-      beginDeliveryAttempt({ output, input, receiptId, pathsAlias });
+      beginDeliveryAttempt({ ownership, input, pathsAlias });
     } catch (cause) {
+      if (cause.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        recorded = { ok: false, status: 'unrecorded', ownershipError: cause };
+      }
       journalError = cause;
     }
   }
-  let artifact;
-  try {
-    artifact = fs.readFileSync(output);
-  } catch (readError) {
-    if (readError.code === 'ENOENT' || readError.code === 'ENOTDIR') {
-      return { ok: true, status: 'absent' };
+  if (!recorded) {
+    let artifact;
+    try {
+      artifact = fs.readFileSync(output);
+    } catch (readError) {
+      if (readError.code === 'ENOENT' || readError.code === 'ENOTDIR') {
+        recorded = { ok: true, status: 'absent' };
+      }
+      // A failed marker does not need an artifact hash to invalidate old evidence.
     }
-    // A failed marker does not need an artifact hash to invalidate old evidence.
+    if (!recorded) {
+      const provenancePath = deliveryProvenancePath(output);
+      let aliasesProtectedPath;
+      try {
+        aliasesProtectedPath = (input && pathsAlias(provenancePath, input))
+          || pathsAlias(provenancePath, output);
+      } catch (aliasError) {
+        recorded = {
+          ok: false,
+          status: 'unrecorded',
+          diagnostic: diagnostic({
+            code: 'delivery/provenance-path-resolution',
+            message: 'Delivery failure provenance could not resolve its target safely.',
+            subject: { output: path.resolve(output), provenance: provenancePath },
+            evidence: {
+              reason: aliasError.message,
+              ...(aliasError?.code ? { systemCode: aliasError.code } : {}),
+            },
+            supportedFixes: ['remove the sidecar path conflict or symbolic-link cycle, then rerun deliver'],
+          }),
+        };
+      }
+      if (!recorded && aliasesProtectedPath) {
+        recorded = {
+          ok: false,
+          status: 'unrecorded',
+          diagnostic: diagnostic({
+            code: 'delivery/provenance-target-alias',
+            message: 'Delivery failure provenance could not be recorded without replacing an input or the artifact.',
+            subject: { output: path.resolve(output), provenance: provenancePath },
+            evidence: { ...(input ? { input: path.resolve(input) } : {}) },
+            supportedFixes: ['choose an output whose .delivery.json sidecar is distinct from every input and the HTML artifact'],
+          }),
+        };
+      }
+      if (!recorded) {
+        try {
+          writeDeliveryProvenance(provenancePath, {
+            schemaVersion: 1,
+            receiptId,
+            status: 'failed',
+            command: 'deliver',
+            stage,
+            input,
+            output: path.resolve(output),
+            ...(artifact ? { artifact: artifactIdentity(artifact) } : {}),
+            error,
+          }, {
+            beforeReplace: () => assertDeliveryOwnership(ownership, 'record failed delivery provenance', {
+              allowInitializing: true,
+              pending: state?.pendingIdentity ? 'owned' : 'ignore',
+            }),
+          });
+          recorded = { ok: true, status: 'failed' };
+        } catch (writeError) {
+          if (writeError.deliveryOwnershipCode === 'delivery/ownership-lost') {
+            recorded = { ok: false, status: 'unrecorded', ownershipError: writeError };
+          } else {
+            recorded = {
+              ok: false,
+              status: 'unrecorded',
+              diagnostic: diagnostic({
+                code: 'delivery/provenance-write',
+                message: 'The failed delivery could not persist its stale-artifact marker.',
+                subject: { output: path.resolve(output), provenance: provenancePath },
+                evidence: {
+                  reason: writeError.message,
+                  ...(writeError?.code ? { systemCode: writeError.code } : {}),
+                  failureJournalRecorded: !journalError,
+                  ...(journalError ? { journalError: journalError.message } : {}),
+                },
+                supportedFixes: ['restore write access to the output directory, then rerun deliver before trusting the artifact'],
+              }),
+            };
+          }
+        }
+      }
+    }
   }
-  const provenancePath = deliveryProvenancePath(output);
-  let aliasesProtectedPath;
-  try {
-    aliasesProtectedPath = (input && pathsAlias(provenancePath, input))
-      || pathsAlias(provenancePath, output);
-  } catch (aliasError) {
-    return {
-      ok: false,
-      status: 'unrecorded',
-      diagnostic: diagnostic({
-        code: 'delivery/provenance-path-resolution',
-        message: 'Delivery failure provenance could not resolve its target safely.',
-        subject: { output: path.resolve(output), provenance: provenancePath },
-        evidence: {
-          reason: aliasError.message,
-          ...(aliasError?.code ? { systemCode: aliasError.code } : {}),
-        },
-        supportedFixes: ['remove the sidecar path conflict or symbolic-link cycle, then rerun deliver'],
-      }),
-    };
+  if (acquiredHere || shouldReleaseSuppliedOwnership) {
+    try {
+      releaseDeliveryOwnership(ownership, { allowInitializing: true });
+    } catch (lockError) {
+      if (lockError.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        if (options.recoveryDirectory) {
+          lockError.deliveryCommitDetails = {
+            recoveryRequired: true,
+            recoveryDirectory: options.recoveryDirectory,
+            recoverableBackups: [],
+          };
+        }
+        return {
+          ...recorded,
+          ok: false,
+          status: 'unrecorded',
+          ownershipError: recorded.ownershipError || lockError,
+          lockError,
+        };
+      }
+      return { ...recorded, lockError: recorded.ownershipError || lockError };
+    }
   }
-  if (aliasesProtectedPath) {
-    return {
-      ok: false,
-      status: 'unrecorded',
-      diagnostic: diagnostic({
-        code: 'delivery/provenance-target-alias',
-        message: 'Delivery failure provenance could not be recorded without replacing an input or the artifact.',
-        subject: { output: path.resolve(output), provenance: provenancePath },
-        evidence: { ...(input ? { input: path.resolve(input) } : {}) },
-        supportedFixes: ['choose an output whose .delivery.json sidecar is distinct from every input and the HTML artifact'],
-      }),
-    };
-  }
-  try {
-    writeDeliveryProvenance(provenancePath, {
-      schemaVersion: 1,
-      receiptId,
-      status: 'failed',
-      command: 'deliver',
-      stage,
-      input,
-      output: path.resolve(output),
-      ...(artifact ? { artifact: artifactIdentity(artifact) } : {}),
-      error,
-    });
-    return { ok: true, status: 'failed' };
-  } catch (writeError) {
-    return {
-      ok: false,
-      status: 'unrecorded',
-      diagnostic: diagnostic({
-        code: 'delivery/provenance-write',
-        message: 'The failed delivery could not persist its stale-artifact marker.',
-        subject: { output: path.resolve(output), provenance: provenancePath },
-        evidence: {
-          reason: writeError.message,
-          ...(writeError?.code ? { systemCode: writeError.code } : {}),
-          failureJournalRecorded: !journalError,
-          ...(journalError ? { journalError: journalError.message } : {}),
-        },
-        supportedFixes: ['restore write access to the output directory, then rerun deliver before trusting the artifact'],
-      }),
-    };
-  }
+  return recorded;
 }
 
 function deliverySuccessProvenance(receipt) {
@@ -587,22 +799,38 @@ function diagnostic({ code, message, subject = {}, evidence = {}, supportedFixes
 }
 
 function deliveryLockFailureDiagnostic(output, error) {
-  const code = error.deliveryLockCode || 'delivery/lock-acquire';
+  const code = error.deliveryOwnershipCode || error.deliveryLockCode || 'delivery/lock-acquire';
   return diagnostic({
     code,
-    message: `Could not start delivery for "${output}": ${error.message}`,
+    message: code === 'delivery/lock-release'
+      ? `Delivery lock could not be released for "${output}": ${error.message}`
+      : code === 'delivery/ownership-lost'
+        ? `Delivery ownership was lost for "${output}": ${error.message}`
+        : `Could not start delivery for "${output}": ${error.message}`,
     subject: { output, lock: deliveryLockPath(output) },
     evidence: {
       reason: error.message,
       ...(error.code ? { systemCode: error.code } : {}),
       ...(error.lockCleanupError ? { cleanupError: error.lockCleanupError } : {}),
+      ...(error.deliveryLockOwner || {}),
+      ...(error.deliveryOwnershipDetails || {}),
+      ...(error.deliveryCommitDetails || {}),
     },
     supportedFixes: code === 'delivery/concurrent-attempt'
-      ? ['wait for the active delivery to finish, then retry']
+        ? ['wait for the active delivery to finish, then retry']
+      : code === 'delivery/lock-stale'
+        ? [
+          'confirm no delivery attempt is active for this output',
+          `remove only the preserved lock "${deliveryLockPath(output)}", then rerun deliver successfully`,
+        ]
       : code === 'delivery/lock-path-conflict'
         ? ['choose an output whose lock path is distinct from the input specification']
         : code === 'delivery/lock-invalid'
           ? ['inspect and preserve the unrecognized lock entry, or choose another output path']
+          : code === 'delivery/ownership-lost'
+            ? ['leave the replacement lock and journal untouched, inspect the reported owner, then retry only after that attempt finishes or is recovered']
+            : code === 'delivery/lock-release'
+              ? ['preserve the reported lock, restore permission to remove that exact entry, then recover serially before retrying']
           : ['resolve the reported filesystem error and any lock cleanup error, then retry'],
   });
 }
@@ -882,11 +1110,12 @@ function commitComparePair({ htmlCandidate, receiptCandidate, outputPath, receip
   }
 }
 
-function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, provenancePath, stagingDirectory, receiptId }) {
+function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, provenancePath, stagingDirectory, ownership }) {
   const targets = [
     { label: 'HTML artifact', target: outputPath, candidate: htmlCandidate, backup: path.join(stagingDirectory, '.previous-output') },
     { label: 'delivery provenance', target: provenancePath, candidate: provenanceCandidate, backup: path.join(stagingDirectory, '.previous-provenance') },
   ];
+  assertDeliveryOwnership(ownership, 'start the delivery pair commit', { pending: 'owned' });
   for (const item of targets) {
     if (!fs.existsSync(item.target)) continue;
     const existing = fs.lstatSync(item.target);
@@ -901,43 +1130,75 @@ function commitDeliveryPair({ htmlCandidate, provenanceCandidate, outputPath, pr
   }
 
   const backedUp = [];
+  const retainedBackups = new Set();
   const committed = [];
   try {
     for (const item of targets) {
       if (!fs.existsSync(item.target)) continue;
+      assertDeliveryOwnership(ownership, `back up the ${item.label}`, { pending: 'owned' });
       fs.renameSync(item.target, item.backup);
       backedUp.push(item);
+      retainedBackups.add(item);
     }
     for (const item of targets) {
+      assertDeliveryOwnership(ownership, `commit the ${item.label}`, { pending: 'owned' });
       fs.renameSync(item.candidate, item.target);
       committed.push(item);
     }
     // Finalization is part of the commit: keep the old files recoverable until
     // the journal has been removed and checkers can accept the new artifact.
-    if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
-      throw new Error('Delivery ownership changed during commit; the pending journal was retained.');
-    }
+    const state = assertDeliveryOwnership(ownership, 'finalize the delivery journal', { pending: 'owned' });
     fs.unlinkSync(deliveryPendingPath(outputPath));
+    assertDeliveryOwnership(ownership, 'finish finalizing the delivery journal', { pending: 'absent' });
+    state.pendingIdentity = undefined;
+    state.phase = 'finalized';
+    return {
+      recoverableBackups: [...retainedBackups].map((item) => ({ label: item.label, path: item.backup })),
+    };
   } catch (cause) {
+    const recoveryDetails = () => ({
+      recoveryRequired: true,
+      recoveryDirectory: stagingDirectory,
+      recoverableBackups: [...retainedBackups].map((item) => ({ label: item.label, path: item.backup })),
+    });
+    if (cause.deliveryOwnershipCode === 'delivery/ownership-lost') {
+      cause.deliveryCommitDetails = { ...(cause.deliveryCommitDetails || {}), ...recoveryDetails() };
+      throw cause;
+    }
     const rollbackErrors = [];
     const recoverableBackups = [];
-    for (const item of [...committed].reverse()) {
-      try {
-        fs.rmSync(item.target, { force: true });
-      } catch (error) {
-        rollbackErrors.push(`${item.label}: remove failed (${error.message})`);
+    try {
+      for (const item of [...committed].reverse()) {
+        try {
+          assertDeliveryOwnership(ownership, `roll back the ${item.label}`, { pending: 'identity' });
+          fs.rmSync(item.target, { force: true });
+        } catch (error) {
+          if (error.deliveryOwnershipCode === 'delivery/ownership-lost') throw error;
+          rollbackErrors.push(`${item.label}: remove failed (${error.message})`);
+        }
       }
-    }
-    for (const item of [...backedUp].reverse()) {
-      try {
-        if (fs.existsSync(item.target)) fs.rmSync(item.target, { force: true });
-        fs.renameSync(item.backup, item.target);
-      } catch (error) {
-        rollbackErrors.push(`${item.label}: restore failed (${error.message})`);
-        // A failed rename leaves the backup at its source path. Record it here
-        // so a later filesystem probe cannot hide the need to retain recovery.
-        recoverableBackups.push({ label: item.label, path: item.backup });
+      for (const item of [...backedUp].reverse()) {
+        try {
+          assertDeliveryOwnership(ownership, `restore the previous ${item.label}`, { pending: 'identity' });
+          if (fs.existsSync(item.target)) fs.rmSync(item.target, { force: true });
+          assertDeliveryOwnership(ownership, `restore the previous ${item.label}`, { pending: 'identity' });
+          fs.renameSync(item.backup, item.target);
+          retainedBackups.delete(item);
+        } catch (error) {
+          if (error.deliveryOwnershipCode === 'delivery/ownership-lost') throw error;
+          rollbackErrors.push(`${item.label}: restore failed (${error.message})`);
+          // A failed restoration leaves this exact backup at its source path.
+          // Record it without probing the failing recovery path again.
+          recoverableBackups.push({ label: item.label, path: item.backup });
+        }
       }
+      assertDeliveryOwnership(ownership, 'finish the delivery rollback', { pending: 'identity' });
+    } catch (rollbackError) {
+      if (rollbackError.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        rollbackError.deliveryCommitDetails = { ...(rollbackError.deliveryCommitDetails || {}), ...recoveryDetails() };
+        throw rollbackError;
+      }
+      rollbackErrors.push(rollbackError.message);
     }
     const error = new Error(rollbackErrors.length
       ? 'Delivery pair commit failed and its previous files could not be fully restored.'
@@ -1342,24 +1603,28 @@ function reportArtifactFailure({ command, json, stage, type, input, output, erro
 function writeDeliveryFailureReceipt(options) {
   const receiptId = options.receiptId || randomUUID();
   const recorded = recordDeliveryFailure({ ...options, receiptId });
-  if (recorded.lockError) {
-    const failureWasRecorded = Boolean(recorded.lockError.deliveryFailureRecord);
-    const lockBlocksFailureRecording = Boolean(recorded.lockError.deliveryLockCode);
+  const ownershipOrLockError = recorded.ownershipError || recorded.lockError;
+  if (ownershipOrLockError) {
+    const failureWasRecorded = recorded.status && recorded.status !== 'unrecorded';
+    const lockBlocksFailureRecording = Boolean(
+      ownershipOrLockError.deliveryLockCode
+      || ownershipOrLockError.deliveryOwnershipCode === 'delivery/ownership-lost',
+    );
     reportArtifactFailure({
       ...options,
       command: 'deliver',
       receiptId,
       error: lockBlocksFailureRecording
-        ? `Could not start delivery for "${options.output}": ${recorded.lockError.message}`
+        ? `Could not safely continue delivery for "${options.output}": ${ownershipOrLockError.message}`
         : options.error,
       ...(failureWasRecorded ? { provenance: recorded.status } : {}),
       diagnostics: [
         ...(!lockBlocksFailureRecording ? (options.diagnostics || []) : []),
-        deliveryLockFailureDiagnostic(options.output, recorded.lockError),
+        deliveryLockFailureDiagnostic(options.output, ownershipOrLockError),
         ...(recorded.diagnostic ? [recorded.diagnostic] : []),
       ],
     });
-    return;
+    return recorded;
   }
   const diagnostics = [
     ...(options.diagnostics || []),
@@ -1372,6 +1637,7 @@ function writeDeliveryFailureReceipt(options) {
     provenance: recorded.status,
     diagnostics,
   });
+  return recorded;
 }
 
 function reportValidateFailure(options) {
@@ -1434,15 +1700,24 @@ async function commandDeliver(args) {
   const renderer = rendererPath(type);
   const { pathsAlias, resolveOutputPath } = await import('../renderers/shared/output-path.mjs');
   const receiptId = randomUUID();
-  let attemptStarted = false;
-  let releaseDeliveryLock;
-  const reportDeliveryFailure = (options) => writeDeliveryFailureReceipt({
-    ...options,
-    pathsAlias,
-    receiptId,
-    attemptStarted,
-    lockOwned: Boolean(releaseDeliveryLock),
-  });
+  let deliveryOwnership;
+  let recoveryRequired = false;
+  let stagingDirectory;
+  const reportDeliveryFailure = (options) => {
+    const ownership = deliveryOwnership;
+    deliveryOwnership = undefined;
+    const recorded = writeDeliveryFailureReceipt({
+      ...options,
+      pathsAlias,
+      receiptId,
+      ownership,
+      releaseOwnership: Boolean(ownership),
+      recoveryDirectory: stagingDirectory,
+    });
+    if (ownership && (recorded?.ownershipError || recorded?.lockError)?.deliveryOwnershipCode === 'delivery/ownership-lost') {
+      recoveryRequired = true;
+    }
+  };
   const inputPath = path.resolve(input);
   let specification;
   let diagram;
@@ -1533,7 +1808,6 @@ async function commandDeliver(args) {
   // Keep the candidate beside the target so the final rename is one
   // same-filesystem commit. A render or artifact-check failure never touches
   // an existing trusted output.
-  let stagingDirectory;
   try {
     stagingDirectory = fs.mkdtempSync(path.join(outputDirectory, '.archify-delivery-'));
   } catch (error) {
@@ -1558,24 +1832,23 @@ async function commandDeliver(args) {
   const candidatePath = path.join(stagingDirectory, path.basename(outputPath));
   const specificationSnapshotPath = path.join(stagingDirectory, 'specification.snapshot.json');
   const provenanceCandidatePath = path.join(stagingDirectory, 'delivery-provenance.json');
-  let recoveryRequired = false;
+  let commitRecoveryBackups = [];
 
   try {
     try {
-      releaseDeliveryLock = acquireDeliveryLock(
+      deliveryOwnership = acquireDeliveryLock(
         outputPath,
         receiptId,
         inputPath,
         pathsAlias,
-        (lockError) => recordDeliveryFailure({
+        (lockError, initializingOwnership) => recordDeliveryFailure({
           output: outputPath,
           stage: 'prepare',
           input: inputPath,
           error: `Could not start delivery for "${outputPath}": ${lockError.message}`,
           receiptId,
           pathsAlias,
-          attemptStarted,
-          lockOwned: true,
+          ownership: initializingOwnership,
         }),
       );
     } catch (error) {
@@ -1594,9 +1867,23 @@ async function commandDeliver(args) {
     }
 
     try {
-      beginDeliveryAttempt({ output: outputPath, input: inputPath, receiptId, pathsAlias });
-      attemptStarted = true;
+      beginDeliveryAttempt({ ownership: deliveryOwnership, input: inputPath, pathsAlias });
     } catch (error) {
+      if (error.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        deliveryOwnership = undefined;
+        recoveryRequired = true;
+        error.deliveryCommitDetails = {
+          recoveryRequired: true,
+          recoveryDirectory: stagingDirectory,
+          recoverableBackups: [],
+        };
+        reportArtifactFailure({
+          command: 'deliver', json, stage: 'prepare', type, input: inputPath, output: outputPath, receiptId,
+          error: `Could not persist the delivery attempt before rendering: ${error.message}`,
+          diagnostics: [deliveryLockFailureDiagnostic(outputPath, error)],
+        });
+        return;
+      }
       reportDeliveryFailure({
         json, stage: 'prepare', type, input: inputPath, output: outputPath,
         error: 'Could not persist the delivery attempt before rendering.',
@@ -1838,20 +2125,34 @@ async function commandDeliver(args) {
     }
 
     try {
-      if (JSON.parse(fs.readFileSync(deliveryPendingPath(outputPath), 'utf8')).receiptId !== receiptId) {
-        throw new Error('A newer delivery attempt owns this output; retry after it finishes.');
-      }
-      commitDeliveryPair({
+      const committed = commitDeliveryPair({
         htmlCandidate: candidatePath,
         provenanceCandidate: provenanceCandidatePath,
         outputPath,
         provenancePath,
         stagingDirectory,
-        receiptId,
+        ownership: deliveryOwnership,
       });
+      commitRecoveryBackups = committed.recoverableBackups;
     } catch (error) {
+      if (error.deliveryOwnershipCode === 'delivery/ownership-lost' && !error.deliveryCommitDetails) {
+        error.deliveryCommitDetails = {
+          recoveryRequired: true,
+          recoveryDirectory: stagingDirectory,
+          recoverableBackups: [],
+        };
+      }
       recoveryRequired = error.deliveryCommitDetails?.recoveryRequired === true;
       const message = `Could not commit verified delivery "${outputPath}": ${error.message}`;
+      if (error.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        deliveryOwnership = undefined;
+        reportArtifactFailure({
+          command: 'deliver', json, stage: 'commit', type, input: inputPath, output: outputPath, receiptId,
+          error: message,
+          diagnostics: [deliveryLockFailureDiagnostic(outputPath, error)],
+        });
+        return;
+      }
       reportDeliveryFailure({
         json,
         stage: 'commit',
@@ -1870,6 +2171,28 @@ async function commandDeliver(args) {
           },
           supportedFixes: ['choose replaceable regular-file artifact and provenance targets on the same writable filesystem'],
         })],
+      });
+      return;
+    }
+
+    try {
+      releaseDeliveryOwnership(deliveryOwnership);
+      deliveryOwnership = undefined;
+    } catch (error) {
+      deliveryOwnership = undefined;
+      if (error.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        recoveryRequired = true;
+        error.deliveryCommitDetails = {
+          recoveryRequired: true,
+          recoveryDirectory: stagingDirectory,
+          recoverableBackups: commitRecoveryBackups,
+        };
+      }
+      const message = `Delivery committed, but its lock could not be released for "${outputPath}": ${error.message}`;
+      reportArtifactFailure({
+        command: 'deliver', json, stage: 'release', type, input: inputPath, output: outputPath, receiptId,
+        error: message,
+        diagnostics: [deliveryLockFailureDiagnostic(outputPath, error)],
       });
       return;
     }
@@ -1902,7 +2225,7 @@ async function commandDeliver(args) {
       if (receipt.open?.status === 'opened') console.log(`opened ${outputPath}`);
     }
   } finally {
-    releaseDeliveryLock?.();
+    if (deliveryOwnership) releaseDeliveryOwnership(deliveryOwnership, { allowInitializing: true });
     if (recoveryRequired) {
       console.error(`Recovery required: delivery backups were retained at "${stagingDirectory}".`);
     } else {

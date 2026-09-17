@@ -77,6 +77,7 @@ test('skill uses recoverable verified delivery for the final artifact', () => {
 test('skill keeps optional opening behind the verified commit and outside automation', () => {
   assert.match(delivery, /Add `--open` only when the user wants an immediate local preview/);
   assert.match(delivery, /runs after[\s\S]*verified pair commit[\s\S]*journal has been\s+removed/);
+  assert.match(delivery, /journal has been removed[\s\S]*delivery lock has been released successfully/);
   assert.match(delivery, /Keep it off for CI, unattended agents, and non-interactive\s+environments/);
   assert.match(delivery, /never invokes an opener/);
   assert.match(delivery, /status proves only whether the local opener invocation succeeded/);

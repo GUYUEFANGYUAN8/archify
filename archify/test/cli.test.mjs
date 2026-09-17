@@ -29,6 +29,31 @@ function deliveryPendingPath(file) {
   return file.replace(/\.html?$/i, '.delivery-pending.json');
 }
 
+function successorDeliveryState({ receiptId, input, output, pid = process.pid }) {
+  return {
+    artifact: '<!doctype html><title>successor artifact</title>\n',
+    lock: `${JSON.stringify({ schemaVersion: 1, receiptId, pid })}\n`,
+    pending: `${JSON.stringify({
+      schemaVersion: 1,
+      command: 'deliver',
+      status: 'pending',
+      receiptId,
+      input: path.resolve(input),
+      output: path.resolve(output),
+    }, null, 2)}\n`,
+    provenance: `${JSON.stringify({
+      schemaVersion: 1,
+      receiptId,
+      status: 'failed',
+      command: 'deliver',
+      stage: 'successor',
+      input: path.resolve(input),
+      output: path.resolve(output),
+      error: 'successor owns this failure record',
+    }, null, 2)}\n`,
+  };
+}
+
 function visualEvidencePaths(file) {
   const base = file.replace(/\.html?$/i, '.visual-check');
   return {
@@ -897,7 +922,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
 });
 
-test('cli: a process exit after HTML commit remains fail-closed until a successful rerun', () => {
+test('cli: portable delivery lock: a process exit requires explicit stale-lock recovery before rerun', () => {
   const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
   const out = path.join(tmp, 'interrupted-delivery-pair.html');
@@ -922,7 +947,10 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
 
   assert.equal(interrupted.status, 86);
   assert.notEqual(sha256(out), initialSha256);
-  assert.equal(fs.existsSync(deliveryPendingPath(out)), true);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  assert.equal(fs.existsSync(pendingPath), true);
   for (const args of [
     ['check', out],
     ['check', out, '--require-provenance'],
@@ -936,6 +964,23 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     );
   }
 
+  const artifactBeforeRecovery = fs.readFileSync(out);
+  const pendingBeforeRecovery = fs.readFileSync(pendingPath);
+  const lockBeforeRecovery = fs.readFileSync(lockPath);
+  const provenanceExisted = fs.existsSync(provenancePath);
+  const provenanceBeforeRecovery = provenanceExisted ? fs.readFileSync(provenancePath) : undefined;
+  const rejected = run(['deliver', 'workflow', replacementInput, out, '--json']);
+  assert.equal(rejected.status, 1, rejected.stderr || rejected.stdout);
+  assert.equal(JSON.parse(rejected.stdout).diagnostics[0].code, 'delivery/lock-stale');
+  assert.deepEqual(fs.readFileSync(out), artifactBeforeRecovery);
+  assert.deepEqual(fs.readFileSync(pendingPath), pendingBeforeRecovery);
+  assert.deepEqual(fs.readFileSync(lockPath), lockBeforeRecovery);
+  assert.equal(fs.existsSync(provenancePath), provenanceExisted);
+  if (provenanceExisted) assert.deepEqual(fs.readFileSync(provenancePath), provenanceBeforeRecovery);
+
+  // Manual recovery is deliberately outside the delivery protocol: after
+  // confirming the recorded PID exited, remove only the reported stale lock.
+  fs.unlinkSync(lockPath);
   const recovered = run(['deliver', 'workflow', replacementInput, out, '--json']);
   assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
   assert.equal(fs.existsSync(deliveryPendingPath(out)), false);
@@ -1079,18 +1124,24 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(JSON.parse(activeStdout).ok, true);
 });
 
-test('cli: a pre-lock failure recovers a stale delivery lock before recording provenance', () => {
+test('cli: portable delivery lock: a stale entry is preserved when a pre-lock failure is reported', () => {
   const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const out = path.join(tmp, 'stale-lock-pre-lock-failure.html');
   assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const artifactBefore = fs.readFileSync(out);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const provenanceBefore = fs.readFileSync(provenancePath);
   const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const stagingBefore = fs.readdirSync(path.dirname(out))
+    .filter((entry) => entry.startsWith('.archify-delivery-')).sort();
   const exited = spawnSync(process.execPath, ['-e', '']);
   assert.equal(exited.status, 0);
-  fs.writeFileSync(lockPath, `${JSON.stringify({
+  const staleLock = `${JSON.stringify({
     schemaVersion: 1,
     receiptId: '00000000-0000-4000-8000-000000000000',
     pid: exited.pid,
-  })}\n`);
+  })}\n`;
+  fs.writeFileSync(lockPath, staleLock);
   const wrapper = path.join(tmp, 'fail-after-stale-delivery-lock.mjs');
   fs.writeFileSync(wrapper, `
 import fs from 'node:fs';
@@ -1111,11 +1162,687 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
 
   assert.equal(failed.status, 1, failed.stderr || failed.stdout);
   const receipt = JSON.parse(failed.stdout);
-  assert.equal(receipt.diagnostics[0].code, 'delivery/prepare-candidate');
-  assert.equal(receipt.provenance, 'failed');
-  assert.equal(JSON.parse(fs.readFileSync(out.replace(/\.html$/, '.delivery.json'))).status, 'failed');
-  assert.equal(fs.existsSync(deliveryPendingPath(out)), true);
-  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/lock-stale');
+  assert.equal('provenance' in receipt, false);
+  assert.equal(receipt.diagnostics[0].subject.output, path.resolve(out));
+  assert.equal(receipt.diagnostics[0].subject.lock, lockPath);
+  assert.equal(receipt.diagnostics[0].evidence.pid, exited.pid);
+  assert.equal(receipt.diagnostics[0].evidence.receiptId, '00000000-0000-4000-8000-000000000000');
+  assert.ok(receipt.diagnostics[0].supportedFixes.some((fix) => /confirm no delivery attempt is active/i.test(fix)));
+  assert.ok(receipt.diagnostics[0].supportedFixes.some((fix) => fix.includes(lockPath)));
+  assert.deepEqual(fs.readFileSync(out), artifactBefore);
+  assert.deepEqual(fs.readFileSync(provenancePath), provenanceBefore);
+  assert.equal(fs.existsSync(deliveryPendingPath(out)), false);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), staleLock);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(out)).filter((entry) => entry.startsWith('.archify-delivery-')).sort(),
+    stagingBefore,
+  );
+});
+
+test('cli: portable delivery lock: simultaneous stale-lock contenders both fail closed', async (t) => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'simultaneous-stale-lock-contenders.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const artifactBefore = fs.readFileSync(out);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const provenanceBefore = fs.readFileSync(provenancePath);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const stagingBefore = fs.readdirSync(path.dirname(out))
+    .filter((entry) => entry.startsWith('.archify-delivery-')).sort();
+  const exited = spawnSync(process.execPath, ['-e', '']);
+  assert.equal(exited.status, 0);
+  const staleLock = `${JSON.stringify({
+    schemaVersion: 1,
+    receiptId: '00000000-0000-4000-8000-000000000000',
+    pid: exited.pid,
+  })}\n`;
+  fs.writeFileSync(lockPath, staleLock);
+  const release = path.join(tmp, 'release-stale-lock-contenders');
+
+  const contenders = ['a', 'b'].map((label) => {
+    const ready = path.join(tmp, `stale-lock-contender-${label}.ready`);
+    const wrapper = path.join(tmp, `stale-lock-contender-${label}.mjs`);
+    fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const processKill = process.kill.bind(process);
+process.kill = (pid, signal) => {
+  if (pid === ${JSON.stringify(exited.pid)} && signal === 0) {
+    fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+    while (!fs.existsSync(${JSON.stringify(release)})) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+    throw Object.assign(new Error('No such process'), { code: 'ESRCH' });
+  }
+  return processKill(pid, signal);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+    const child = spawn(process.execPath, [wrapper], { cwd: skillRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exitedPromise = new Promise((resolve) => {
+      child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+    });
+    return { child, ready, exitedPromise };
+  });
+  t.after(() => {
+    if (!fs.existsSync(release)) fs.writeFileSync(release, 'release');
+    for (const { child } of contenders) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  });
+
+  const deadline = Date.now() + 5000;
+  while (contenders.some(({ ready }) => !fs.existsSync(ready)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(contenders.every(({ ready }) => fs.existsSync(ready)), true, 'both contenders did not inspect the stale lock');
+  fs.writeFileSync(release, 'release');
+  const results = await Promise.all(contenders.map(({ exitedPromise }) => exitedPromise));
+
+  for (const result of results) {
+    assert.deepEqual({ code: result.code, signal: result.signal }, { code: 1, signal: null }, result.stderr || result.stdout);
+    const receipt = JSON.parse(result.stdout);
+    assert.equal(receipt.diagnostics[0].code, 'delivery/lock-stale');
+    assert.equal('provenance' in receipt, false);
+  }
+  assert.deepEqual(fs.readFileSync(out), artifactBefore);
+  assert.deepEqual(fs.readFileSync(provenancePath), provenanceBefore);
+  assert.equal(fs.existsSync(deliveryPendingPath(out)), false);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), staleLock);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(out)).filter((entry) => entry.startsWith('.archify-delivery-')).sort(),
+    stagingBefore,
+  );
+});
+
+test('cli: portable delivery lock: lost ownership prevents failure provenance writes', () => {
+  const validInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const invalidInput = path.join(tmp, 'lost-delivery-ownership.workflow.json');
+  const invalid = JSON.parse(fs.readFileSync(validInput, 'utf8'));
+  invalid.nodes[0].unexpected = true;
+  fs.writeFileSync(invalidInput, JSON.stringify(invalid));
+  const out = path.join(tmp, 'lost-delivery-ownership.html');
+  assert.equal(run(['deliver', 'workflow', validInput, out, '--json']).status, 0);
+  const artifactBefore = fs.readFileSync(out);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const provenanceBefore = fs.readFileSync(provenancePath);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successorReceiptId = '11111111-1111-4111-8111-111111111111';
+  const successorLock = `${JSON.stringify({
+    schemaVersion: 1,
+    receiptId: successorReceiptId,
+    pid: process.pid,
+  })}\n`;
+  const successorPending = `${JSON.stringify({
+    schemaVersion: 1,
+    command: 'deliver',
+    status: 'pending',
+    receiptId: successorReceiptId,
+    input: path.resolve(validInput),
+    output: path.resolve(out),
+  }, null, 2)}\n`;
+  const successorProvenance = `${JSON.stringify({
+    schemaVersion: 1,
+    receiptId: successorReceiptId,
+    status: 'failed',
+    command: 'deliver',
+    stage: 'successor',
+    input: path.resolve(validInput),
+    output: path.resolve(out),
+    error: 'successor owns this failure record',
+  }, null, 2)}\n`;
+  const wrapper = path.join(tmp, 'lose-delivery-ownership.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const renameSync = fs.renameSync;
+const writeFileSync = fs.writeFileSync;
+let replaced = false;
+fs.renameSync = (source, target) => {
+  const result = renameSync(source, target);
+  if (!replaced && String(target) === ${JSON.stringify(pendingPath)} && String(source).includes('.archify-provenance-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.lost-owner`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successorLock)});
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successorPending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successorProvenance)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(invalidInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.ok, false);
+  assert.ok(receipt.diagnostics.some((entry) => entry.code === 'delivery/ownership-lost'));
+  assert.ok(!('provenance' in receipt) || receipt.provenance === 'unrecorded');
+  assert.deepEqual(fs.readFileSync(out), artifactBefore);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successorProvenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successorLock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successorPending);
+});
+
+test('cli: portable delivery lock: journal creation cannot overwrite a successor', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'lost-ownership-before-journal-rename.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '12121212-1212-4212-8212-121212121212',
+    input,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-before-journal-rename.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+import path from 'node:path';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let replaced = false;
+fs.writeFileSync = (file, ...args) => {
+  const result = writeFileSync(file, ...args);
+  if (!replaced && path.basename(String(file)) === ${JSON.stringify(path.basename(pendingPath))}
+      && path.basename(path.dirname(String(file))).startsWith('.archify-provenance-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal('provenance' in receipt, false);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: an unverifiable new journal loses ownership', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'unverifiable-new-journal.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const artifactBefore = fs.readFileSync(out);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const provenanceBefore = fs.readFileSync(provenancePath);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const wrapper = path.join(tmp, 'unverifiable-new-journal.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const lstatSync = fs.lstatSync;
+let injected = false;
+fs.lstatSync = (file, ...args) => {
+  if (!injected && String(file) === ${JSON.stringify(pendingPath)} && fs.existsSync(file)) {
+    injected = true;
+    throw Object.assign(new Error('injected journal identity failure'), { code: 'EACCES' });
+  }
+  return lstatSync(file, ...args);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal(receipt.diagnostics[0].evidence.systemCode, 'EACCES');
+  assert.equal('provenance' in receipt, false);
+  assert.deepEqual(fs.readFileSync(out), artifactBefore);
+  assert.deepEqual(fs.readFileSync(provenancePath), provenanceBefore);
+  assert.equal(fs.existsSync(pendingPath), true);
+  assert.equal(fs.existsSync(lockPath), true);
+});
+
+test('cli: portable delivery lock: release loss cannot claim failed provenance', () => {
+  const validInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const invalidInput = path.join(tmp, 'release-loss-after-failure.workflow.json');
+  const invalid = JSON.parse(fs.readFileSync(validInput, 'utf8'));
+  invalid.nodes[0].unexpected = true;
+  fs.writeFileSync(invalidInput, JSON.stringify(invalid));
+  const out = path.join(tmp, 'release-loss-after-failure.html');
+  assert.equal(run(['deliver', 'workflow', validInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '13131313-1313-4313-8313-131313131313',
+    input: validInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-after-failure-provenance.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let replaced = false;
+fs.renameSync = (source, target) => {
+  const result = renameSync(source, target);
+  if (!replaced && String(target) === ${JSON.stringify(provenancePath)}
+      && String(source).includes('.archify-provenance-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(invalidInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.ok(!('provenance' in receipt) || receipt.provenance === 'unrecorded');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.equal(fs.existsSync(receipt.diagnostics[0].evidence.recoveryDirectory), true);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: commit entry preserves a successor owner', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'lost-ownership-before-commit.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '22222222-2222-4222-8222-222222222222',
+    input: replacementInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-before-commit.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+import path from 'node:path';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let replaced = false;
+fs.writeFileSync = (file, ...args) => {
+  const result = writeFileSync(file, ...args);
+  if (!replaced && path.basename(String(file)) === 'delivery-provenance.json'
+      && path.basename(path.dirname(String(file))).startsWith('.archify-delivery-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal('provenance' in receipt, false);
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.equal(fs.existsSync(receipt.diagnostics[0].evidence.recoveryDirectory), true);
+  assert.match(failed.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: rollback stops after ownership is lost', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'lost-ownership-before-rollback.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const priorArtifact = fs.readFileSync(out);
+  const priorProvenance = fs.readFileSync(provenancePath);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '33333333-3333-4333-8333-333333333333',
+    input: replacementInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-before-rollback.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+import path from 'node:path';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let replaced = false;
+fs.renameSync = (source, target) => {
+  if (!replaced && path.basename(String(source)) === 'delivery-provenance.json'
+      && path.basename(path.dirname(String(source))).startsWith('.archify-delivery-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+    throw Object.assign(new Error('injected provenance commit failure'), { code: 'EACCES' });
+  }
+  return renameSync(source, target);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.ok(receipt.diagnostics[0].evidence.recoverableBackups.length >= 1);
+  const outputBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'HTML artifact');
+  const provenanceBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'delivery provenance');
+  assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
+  assert.deepEqual(fs.readFileSync(provenanceBackup.path), priorProvenance);
+  assert.match(failed.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: finalization preserves a successor owner', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'lost-ownership-before-finalization.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const priorArtifact = fs.readFileSync(out);
+  const priorProvenance = fs.readFileSync(provenancePath);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '44444444-4444-4444-8444-444444444444',
+    input: replacementInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-before-finalization.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+import path from 'node:path';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let replaced = false;
+fs.renameSync = (source, target) => {
+  const result = renameSync(source, target);
+  if (!replaced && path.basename(String(source)) === 'delivery-provenance.json'
+      && path.basename(path.dirname(String(source))).startsWith('.archify-delivery-')) {
+    replaced = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  const outputBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'HTML artifact');
+  const provenanceBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'delivery provenance');
+  assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
+  assert.deepEqual(fs.readFileSync(provenanceBackup.path), priorProvenance);
+  assert.match(failed.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: release preserves a successor owner', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'lost-ownership-before-release.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const priorArtifact = fs.readFileSync(out);
+  const priorProvenance = fs.readFileSync(provenancePath);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '55555555-5555-4555-8555-555555555555',
+    input: replacementInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lose-ownership-before-release.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+const unlinkSync = fs.unlinkSync;
+const lstatSync = fs.lstatSync;
+let journalFinalized = false;
+let replaced = false;
+fs.unlinkSync = (file, ...args) => {
+  const result = unlinkSync(file, ...args);
+  if (String(file) === ${JSON.stringify(pendingPath)}) journalFinalized = true;
+  return result;
+};
+fs.lstatSync = (file, ...args) => {
+  try {
+    return lstatSync(file, ...args);
+  } catch (error) {
+    if (!replaced && journalFinalized && String(file) === ${JSON.stringify(pendingPath)} && error.code === 'ENOENT') {
+      replaced = true;
+      renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+      writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+      writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+      writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+      writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+    }
+    throw error;
+  }
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.stage, 'release');
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  const outputBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'HTML artifact');
+  const provenanceBackup = receipt.diagnostics[0].evidence.recoverableBackups
+    .find((entry) => entry.label === 'delivery provenance');
+  assert.deepEqual(fs.readFileSync(outputBackup.path), priorArtifact);
+  assert.deepEqual(fs.readFileSync(provenanceBackup.path), priorProvenance);
+  assert.match(failed.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: release rejects a recreated journal', () => {
+  const initialInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const replacementInput = path.join(skillRoot, 'examples/incident-response.workflow.json');
+  const out = path.join(tmp, 'recreated-journal-before-release.html');
+  assert.equal(run(['deliver', 'workflow', initialInput, out, '--json']).status, 0);
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '66666666-6666-4666-8666-666666666666',
+    input: replacementInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'recreate-journal-before-release.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const writeFileSync = fs.writeFileSync;
+const unlinkSync = fs.unlinkSync;
+const lstatSync = fs.lstatSync;
+let journalFinalized = false;
+let postFinalizeLockChecks = 0;
+let journalRecreated = false;
+fs.unlinkSync = (file, ...args) => {
+  const result = unlinkSync(file, ...args);
+  if (String(file) === ${JSON.stringify(pendingPath)}) journalFinalized = true;
+  return result;
+};
+fs.lstatSync = (file, ...args) => {
+  if (journalFinalized && String(file) === ${JSON.stringify(lockPath)}) {
+    postFinalizeLockChecks += 1;
+    if (postFinalizeLockChecks === 2) {
+      writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)}, { flag: 'wx' });
+      journalRecreated = true;
+    }
+  }
+  if (journalRecreated && String(file).includes('.previous-')) {
+    throw Object.assign(new Error('injected recovery backup inspection failure'), { code: 'EACCES' });
+  }
+  return lstatSync(file, ...args);
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(replacementInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.stage, 'release');
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.ok(receipt.diagnostics[0].evidence.recoverableBackups.length >= 1);
+  assert.equal(fs.existsSync(receipt.diagnostics[0].evidence.recoveryDirectory), true);
+  assert.equal(fs.existsSync(receipt.diagnostics[0].evidence.recoverableBackups[0].path), true);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+  assert.equal(fs.existsSync(lockPath), true);
+  const strict = run(['check', out, '--require-provenance']);
+  assert.equal(strict.status, 1, strict.stderr || strict.stdout);
+  assert.equal(JSON.parse(strict.stdout).diagnostics[0].code, 'delivery/provenance-failed');
+});
+
+test('cli: portable delivery lock: release failure cannot claim delivery success', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-lock-release-failure.html');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const wrapper = path.join(tmp, 'delivery-lock-release-failure.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const unlinkSync = fs.unlinkSync;
+let journalFinalized = false;
+fs.unlinkSync = (file, ...args) => {
+  if (String(file) === ${JSON.stringify(lockPath)} && journalFinalized) {
+    throw Object.assign(new Error('injected lock release failure'), { code: 'EACCES' });
+  }
+  const result = unlinkSync(file, ...args);
+  if (String(file) === ${JSON.stringify(pendingPath)}) journalFinalized = true;
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.ok, false);
+  assert.equal(receipt.stage, 'release');
+  assert.equal(receipt.diagnostics[0].code, 'delivery/lock-release');
+  assert.equal(fs.existsSync(pendingPath), false);
+  const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+  assert.equal(provenance.status, 'current');
+  assert.equal(lock.receiptId, provenance.receiptId);
+  const strict = run(['check', out, '--require-provenance']);
+  assert.equal(strict.status, 1, strict.stderr || strict.stdout);
+  assert.equal(JSON.parse(strict.stdout).diagnostics[0].code, 'delivery/provenance-locked');
+});
+
+test('cli: lock release failure does not invoke the requested opener', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('fake open and xdg-open executables cover POSIX opener dispatch');
+    return;
+  }
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'delivery-lock-release-no-open.html');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const fake = makeFakeOpeners('delivery-lock-release-no-open');
+  const wrapper = path.join(tmp, 'delivery-lock-release-no-open.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const unlinkSync = fs.unlinkSync;
+let journalFinalized = false;
+fs.unlinkSync = (file, ...args) => {
+  if (String(file) === ${JSON.stringify(lockPath)} && journalFinalized) {
+    throw Object.assign(new Error('injected lock release failure'), { code: 'EACCES' });
+  }
+  const result = unlinkSync(file, ...args);
+  if (String(file) === ${JSON.stringify(pendingPath)}) journalFinalized = true;
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json', '--open'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], {
+    cwd: skillRoot,
+    encoding: 'utf8',
+    env: fake.env,
+  });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  assert.equal(JSON.parse(failed.stdout).diagnostics[0].code, 'delivery/lock-release');
+  assert.equal(fs.existsSync(fake.log), false);
 });
 
 for (const failureMode of ['empty-write', 'partial-write', 'close', 'replacement', 'cleanup-failure']) {
@@ -1164,8 +1891,17 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     const result = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
     assert.equal(result.status, 1, result.stderr || result.stdout);
     const receipt = JSON.parse(result.stdout);
-    assert.equal(receipt.diagnostics[0].code, 'delivery/lock-acquire');
-    assert.equal(receipt.diagnostics[0].evidence.systemCode, 'ENOSPC');
+    const expectedDiagnostic = failureMode === 'replacement'
+      ? 'delivery/ownership-lost'
+      : failureMode === 'cleanup-failure'
+        ? 'delivery/lock-release'
+        : 'delivery/lock-acquire';
+    assert.equal(receipt.diagnostics[0].code, expectedDiagnostic);
+    if (failureMode === 'replacement' || failureMode === 'cleanup-failure') {
+      assert.equal(receipt.diagnostics[0].evidence.initializationSystemCode, 'ENOSPC');
+    } else {
+      assert.equal(receipt.diagnostics[0].evidence.systemCode, 'ENOSPC');
+    }
     assert.equal(sha256(out), previousHash);
     const expectedProvenanceCode = failureMode === 'replacement'
       ? /^delivery\/provenance-locked$/
@@ -1185,7 +1921,9 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     }
     if (failureMode === 'cleanup-failure') {
       assert.equal(fs.existsSync(lockPath), true);
-      assert.match(receipt.diagnostics[0].evidence.cleanupError, /injected lock cleanup failure/);
+      assert.equal(receipt.diagnostics[0].evidence.systemCode, 'EACCES');
+      assert.match(receipt.diagnostics[0].evidence.reason, /injected lock cleanup failure/);
+      assert.doesNotMatch(receipt.diagnostics[0].message, /committed/i);
       return;
     }
     assert.equal(fs.existsSync(lockPath), false);
