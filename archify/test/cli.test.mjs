@@ -1332,6 +1332,63 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
   assert.equal(fs.readFileSync(pendingPath, 'utf8'), successorPending);
 });
 
+test('cli: portable delivery lock: failure provenance ownership loss reports retained recovery state', () => {
+  const validInput = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const invalidInput = path.join(tmp, 'failure-provenance-ownership-loss.workflow.json');
+  const invalid = JSON.parse(fs.readFileSync(validInput, 'utf8'));
+  invalid.nodes[0].unexpected = true;
+  fs.writeFileSync(invalidInput, JSON.stringify(invalid));
+  const out = path.join(tmp, 'failure-provenance-ownership-loss.html');
+  assert.equal(run(['deliver', 'workflow', validInput, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '15151515-1515-4515-8515-151515151515',
+    input: validInput,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'failure-provenance-ownership-loss.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+import path from 'node:path';
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let successorInstalled = false;
+fs.writeFileSync = (file, ...args) => {
+  const result = writeFileSync(file, ...args);
+  if (!successorInstalled
+      && path.basename(String(file)) === ${JSON.stringify(path.basename(provenancePath))}
+      && path.basename(path.dirname(String(file))).startsWith('.archify-provenance-')) {
+    successorInstalled = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(invalidInput)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.ok(!('provenance' in receipt) || receipt.provenance === 'unrecorded');
+  assert.equal(receipt.diagnostics[0].evidence.recoveryRequired, true);
+  assert.equal(fs.existsSync(receipt.diagnostics[0].evidence.recoveryDirectory), true);
+  assert.deepEqual(receipt.diagnostics[0].evidence.recoverableBackups, []);
+  assert.match(failed.stderr, /Recovery required: delivery backups were retained/);
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
 test('cli: portable delivery lock: journal creation cannot overwrite a successor', () => {
   const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
   const out = path.join(tmp, 'lost-ownership-before-journal-rename.html');
@@ -1899,7 +1956,7 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
 });
 
 for (const failureMode of ['empty-write', 'partial-write', 'close', 'replacement', 'zero-identity-replacement', 'cleanup-failure']) {
-  test(`cli: failed lock initialization is cleaned up and delivery can retry (${failureMode})`, () => {
+  test(`cli: portable delivery lock: failed lock initialization is cleaned up and delivery can retry (${failureMode})`, () => {
     const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
     const out = path.join(tmp, `lock-init-${failureMode}.html`);
     assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
@@ -2001,6 +2058,86 @@ await import(${JSON.stringify(pathToFileURL(cli).href)});
     assert.equal(run(['check', out, '--require-provenance']).status, 0);
   });
 }
+
+test('cli: portable delivery lock: initialization ownership loss cannot claim failed provenance', () => {
+  const input = path.join(skillRoot, 'examples/agent-tool-call.workflow.json');
+  const out = path.join(tmp, 'lock-init-ownership-loss.html');
+  assert.equal(run(['deliver', 'workflow', input, out, '--json']).status, 0);
+  const provenancePath = out.replace(/\.html$/, '.delivery.json');
+  const pendingPath = deliveryPendingPath(out);
+  const lockPath = out.replace(/\.html$/, '.delivery-lock.json');
+  const successor = successorDeliveryState({
+    receiptId: '14141414-1414-4414-8414-141414141414',
+    input,
+    output: out,
+  });
+  const wrapper = path.join(tmp, 'lock-init-ownership-loss.mjs');
+  fs.writeFileSync(wrapper, `
+import fs from 'node:fs';
+const openSync = fs.openSync;
+const writeFileSync = fs.writeFileSync;
+const renameSync = fs.renameSync;
+let lockDescriptor;
+let initializationFailed = false;
+let successorInstalled = false;
+fs.openSync = (file, ...args) => {
+  const descriptor = openSync(file, ...args);
+  if (String(file) === ${JSON.stringify(lockPath)}) lockDescriptor = descriptor;
+  return descriptor;
+};
+fs.writeFileSync = (file, ...args) => {
+  if (file === lockDescriptor && !initializationFailed) {
+    initializationFailed = true;
+    throw Object.assign(new Error('injected lock initialization failure'), { code: 'ENOSPC' });
+  }
+  return writeFileSync(file, ...args);
+};
+fs.renameSync = (source, target) => {
+  const result = renameSync(source, target);
+  if (!successorInstalled && initializationFailed
+      && String(target) === ${JSON.stringify(provenancePath)}
+      && String(source).includes('.archify-provenance-')) {
+    successorInstalled = true;
+    renameSync(${JSON.stringify(lockPath)}, ${JSON.stringify(`${lockPath}.owner-a`)});
+    writeFileSync(${JSON.stringify(lockPath)}, ${JSON.stringify(successor.lock)}, { flag: 'wx' });
+    writeFileSync(${JSON.stringify(pendingPath)}, ${JSON.stringify(successor.pending)});
+    writeFileSync(${JSON.stringify(provenancePath)}, ${JSON.stringify(successor.provenance)});
+    writeFileSync(${JSON.stringify(out)}, ${JSON.stringify(successor.artifact)});
+  }
+  return result;
+};
+process.argv = [process.execPath, ${JSON.stringify(cli)}, 'deliver', 'workflow', ${JSON.stringify(input)}, ${JSON.stringify(out)}, '--json'];
+await import(${JSON.stringify(pathToFileURL(cli).href)});
+`);
+
+  const failed = spawnSync(process.execPath, [wrapper], { cwd: skillRoot, encoding: 'utf8' });
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.diagnostics[0].code, 'delivery/ownership-lost');
+  assert.ok(!('provenance' in receipt) || receipt.provenance === 'unrecorded');
+  assert.equal(receipt.diagnostics[0].evidence.initializationSystemCode, 'ENOSPC');
+  assert.equal(fs.readFileSync(out, 'utf8'), successor.artifact);
+  assert.equal(fs.readFileSync(provenancePath, 'utf8'), successor.provenance);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), successor.lock);
+  assert.equal(fs.readFileSync(pendingPath, 'utf8'), successor.pending);
+});
+
+test('cli: portable delivery lock: a raw acquisition error does not obscure the input diagnosis', () => {
+  const input = path.join(tmp, 'invalid-input-before-lock.json');
+  const out = path.join(tmp, 'missing-output-parent', 'invalid-input.html');
+  fs.writeFileSync(input, '{ invalid json');
+
+  const failed = run(['deliver', 'workflow', input, out, '--json']);
+
+  assert.equal(failed.status, 1, failed.stderr || failed.stdout);
+  const receipt = JSON.parse(failed.stdout);
+  assert.equal(receipt.stage, 'input');
+  assert.equal(receipt.diagnostics[0].code, 'input/json-parse');
+  assert.equal(receipt.diagnostics[1].code, 'delivery/lock-acquire');
+  assert.equal(receipt.diagnostics[1].evidence.systemCode, 'ENOENT');
+  assert.equal(fs.existsSync(out), false);
+});
 
 test('cli: delivery lock cannot replace its input specification', () => {
   const input = path.join(tmp, 'lock-input-alias.delivery-lock.json');

@@ -236,7 +236,9 @@ function acquireDeliveryLock(output, receiptId, inputPath, pathsAlias, recordIni
             initializationError: error.message,
             ...(error?.code ? { initializationSystemCode: error.code } : {}),
           };
-          if (error.deliveryFailureRecord) cleanupError.deliveryFailureRecord = error.deliveryFailureRecord;
+          if (cleanupError.deliveryOwnershipCode === 'delivery/lock-release' && error.deliveryFailureRecord) {
+            cleanupError.deliveryFailureRecord = error.deliveryFailureRecord;
+          }
           throw cleanupError;
         }
         error.lockCleanupError = cleanupError.message;
@@ -477,8 +479,10 @@ function recordDeliveryFailure(options) {
       releaseDeliveryOwnership(ownership, { allowInitializing: true });
     } catch (lockError) {
       if (lockError.deliveryOwnershipCode === 'delivery/ownership-lost') {
+        const ownershipError = recorded.ownershipError || lockError;
         if (options.recoveryDirectory) {
-          lockError.deliveryCommitDetails = {
+          ownershipError.deliveryCommitDetails = {
+            ...(ownershipError.deliveryCommitDetails || {}),
             recoveryRequired: true,
             recoveryDirectory: options.recoveryDirectory,
             recoverableBackups: [],
@@ -488,7 +492,7 @@ function recordDeliveryFailure(options) {
           ...recorded,
           ok: false,
           status: 'unrecorded',
-          ownershipError: recorded.ownershipError || lockError,
+          ownershipError,
           lockError,
         };
       }
@@ -1636,11 +1640,17 @@ function writeDeliveryFailureReceipt(options) {
         ? `Could not safely continue delivery for "${options.output}": ${ownershipOrLockError.message}`
         : options.error,
       ...(failureWasRecorded ? { provenance: recorded.status } : {}),
-      diagnostics: [
-        deliveryLockFailureDiagnostic(options.output, ownershipOrLockError),
-        ...(options.diagnostics || []),
-        ...(recorded.diagnostic ? [recorded.diagnostic] : []),
-      ],
+      diagnostics: lockOrOwnershipFailure
+        ? [
+          deliveryLockFailureDiagnostic(options.output, ownershipOrLockError),
+          ...(options.diagnostics || []),
+          ...(recorded.diagnostic ? [recorded.diagnostic] : []),
+        ]
+        : [
+          ...(options.diagnostics || []),
+          deliveryLockFailureDiagnostic(options.output, ownershipOrLockError),
+          ...(recorded.diagnostic ? [recorded.diagnostic] : []),
+        ],
     });
     return recorded;
   }
